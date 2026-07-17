@@ -201,7 +201,7 @@ def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query):
             pil_image = Image.fromarray(np.array(image, dtype=np.uint8))
 
         buffered = io.BytesIO()
-        pil_image.save(buffered, format="JPEG")
+        pil_image.save(buffered, format="PNG")
         encoded_images.append(base64.b64encode(buffered.getvalue()).decode())
 
     # Prepare request data

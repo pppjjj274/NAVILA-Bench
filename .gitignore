@@ -2,3 +2,20 @@
 isaaclab_exts/omni.isaac.vlnce/assets
 *.pyc
 *.egg-info
+__pycache__/
+.pytest_cache/
+
+# Isaac Sim / Slurm / local run outputs
+*.out
+*.err
+*.log
+nohup.out
+eval_results/
+videos/
+
+# Accidental files created when command-line arguments are passed as paths
+--headless
+--enable_cameras
+--history_length=9
+--load_run=2024-09-25_23-22-02
+--task=go2_matterport_vision
