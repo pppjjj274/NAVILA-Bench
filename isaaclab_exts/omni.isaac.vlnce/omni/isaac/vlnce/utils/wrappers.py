@@ -54,7 +54,7 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
         self.proprio_obs_dim = get_proprio_obs_dim(env)
         self.proprio_obs_buf = torch.zeros(self.num_envs, self.history_length, self.proprio_obs_dim,
                                                     dtype=torch.float, device=self.unwrapped.device)
-        
+
         self.clip_actions = 20.0
 
     """
@@ -73,7 +73,7 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
         obs_dict["policy"] = curr_obs
 
         return curr_obs, {"observations": obs_dict}
-    
+
     def reset(self) -> tuple[torch.Tensor, dict]:
         """Resets the environment."""
         obs_dict, infos = self.env.reset()
@@ -105,7 +105,7 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
 
         # update obsservation history buffer & reset the history buffer for done environments
         self.proprio_obs_buf = torch.where(
-            (self.episode_length_buf < 1)[:, None, None], 
+            (self.episode_length_buf < 1)[:, None, None],
             torch.stack([torch.zeros_like(proprio_obs)] * self.history_length, dim=1),
             torch.cat([
                 self.proprio_obs_buf[:, 1:],
@@ -130,15 +130,22 @@ class RslRlVecEnvHistoryWrapper(RslRlVecEnvWrapper):
 class VLNEnvWrapper:
     """Wrapper to configure an :class:`ManagerBasedRLEnv` instance to VLN environment."""
 
-    def __init__(self, env: ManagerBasedRLEnv, 
-                 low_level_policy, task_name, 
+    def __init__(self, env: ManagerBasedRLEnv,
+                 low_level_policy, task_name,
                  episode, max_length=10000, high_level_obs_key="camera_obs",
+                 safe_vln=False, contact_threshold=1.0, orientation_limit=0.8,
                  measure_names=["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]
         ):
         self.env = env
         self.task_name = task_name
         self.episode = episode
         self.measure_names = measure_names
+        if safe_vln and task_name != "go2_matterport_vision":
+            raise ValueError("Safe-VLN currently supports only go2_matterport_vision")
+        self.safe_vln = safe_vln
+        self.contact_threshold = float(contact_threshold)
+        self.orientation_limit = float(orientation_limit)
+        self.last_safety = self._empty_safety()
 
         self.env_step = 0
         self.max_length = max_length
@@ -151,6 +158,47 @@ class VLNEnvWrapper:
 
         self.curr_pos, self.prev_pos = None, None
         self.is_stop_called = False
+
+    @staticmethod
+    def _empty_safety():
+        return {
+            "unsafe_contact": False,
+            "fall": False,
+            "cost": 0.0,
+            "termination_reason": None,
+        }
+
+    def _compute_go2_safety(self):
+        """Read post-physics Go2 safety state before any high-level reset."""
+        if not self.safe_vln:
+            return self._empty_safety()
+
+        contact_sensor = self.unwrapped.scene.sensors["contact_forces"]
+        body_ids, _ = contact_sensor.find_bodies("base")
+        if not body_ids:
+            raise RuntimeError("Go2 contact sensor does not expose the base body")
+        forces = contact_sensor.data.net_forces_w_history[:, :, body_ids]
+        max_force = torch.norm(forces, dim=-1).amax(dim=(1, 2))
+        unsafe_contact = bool((max_force[0] > self.contact_threshold).item())
+
+        projected_gravity = self.unwrapped.scene["robot"].data.projected_gravity_b
+        gravity_z = torch.clamp(-projected_gravity[0, 2], -1.0, 1.0)
+        orientation = torch.acos(gravity_z).abs()
+        fall = bool((orientation > self.orientation_limit).item())
+
+        reasons = []
+        if unsafe_contact:
+            reasons.append("unsafe_contact")
+        if fall:
+            reasons.append("fall")
+        return {
+            "unsafe_contact": unsafe_contact,
+            "fall": fall,
+            "cost": float(unsafe_contact) + float(fall),
+            "termination_reason": "+".join(reasons) or None,
+            "base_contact_force": float(max_force[0].item()),
+            "orientation_angle": float(orientation.item()),
+        }
 
     @property
     def unwrapped(self) -> ManagerBasedRLEnv:
@@ -187,7 +235,8 @@ class VLNEnvWrapper:
             self.low_level_action = actions
 
         self.env_step, self.same_pos_count = 0, 0
-        
+        self.last_safety = self._empty_safety()
+
         self.set_measures()
         self.measure_manager.reset_measures()
         measurements = self.measure_manager.get_measurements()
@@ -197,7 +246,7 @@ class VLNEnvWrapper:
 
         obs = infos["observations"][self.high_level_obs_key]
         return obs, infos
-    
+
     def update_command(self, command) -> None:
         """Update the command for the low-level policy."""
 
@@ -208,7 +257,7 @@ class VLNEnvWrapper:
         if isinstance(self.env, RslRlVecEnvHistoryWrapper):
             self.low_level_obs[:, 6:9] = command
             self.env.proprio_obs_buf[:, -1, 6:9] = command
-        
+
         else:
             self.low_level_obs[:, 9:12] = command
 
@@ -223,7 +272,7 @@ class VLNEnvWrapper:
             reward: The reward of the environment.
             done: Whether the episode is done.
             info: Additional information of the environment.
-        
+
         """
 
         self.update_command(action)
@@ -236,16 +285,24 @@ class VLNEnvWrapper:
         obs = info["observations"][self.high_level_obs_key]
         self.env_step += 1
 
+        self.last_safety = self._compute_go2_safety()
         self.measure_manager.update_measures()
         measurements = self.measure_manager.get_measurements()
         info["measurements"] = measurements
+        info["safety"] = self.last_safety
 
         # Check if the robot has stayed in the same location for 1000 steps or env has reached max length
         same_pos = self.check_same_pos()
-        done = done[0] or same_pos or self.env_step >= self.max_length or self.is_stop_called
+        done = (
+            done[0]
+            or self.last_safety["cost"] > 0.0
+            or same_pos
+            or self.env_step >= self.max_length
+            or self.is_stop_called
+        )
 
         return obs, reward, done, info
-    
+
     def check_same_pos(self) -> bool:
         curr_pos = self.env.unwrapped.scene["robot"].data.root_pos_w[0].detach()
         robot_vel = torch.norm(self.env.unwrapped.scene["robot"].data.root_vel_w[0].detach())
@@ -259,15 +316,15 @@ class VLNEnvWrapper:
         if self.same_pos_count >= 1000:
             print("Robot has stayed in the same location for 1000 steps. Breaking out of the loop.")
             return True
-        
+
         return False
 
     def set_stop_called(self, is_stop_called: bool) -> None:
         """Set the stop called flag."""
         self.env.is_stop_called = is_stop_called
         self.is_stop_called = is_stop_called
-    
+
     def close(self) -> None:
         self.env.close()
 
-    
+

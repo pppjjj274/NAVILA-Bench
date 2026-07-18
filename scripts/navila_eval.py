@@ -8,19 +8,15 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
-import gymnasium as gym
 import os
 import json
 import math
-import torch
-import numpy as np
-import imageio
-from PIL import Image
 import time
 import base64
 import io
 import socket
 import json
+
 
 from omni.isaac.lab.app import AppLauncher
 
@@ -45,6 +41,17 @@ parser.add_argument("--visualize_path", action="store_true", default=False, help
 parser.add_argument("--device", type=str, default="cuda")
 parser.add_argument("--vlm_host", type=str, default="localhost")
 parser.add_argument("--vlm_port", type=int, default=54321)
+parser.add_argument("--max_episode_seconds", type=float, default=None)
+parser.add_argument("--max_vlm_calls", type=int, default=None)
+parser.add_argument("--safe-vln", action="store_true", help="Enable Go2 CMDP safety evaluation and trajectory output.")
+parser.add_argument("--safe-gamma", type=float, default=0.99)
+parser.add_argument("--safe-cost-limit", type=float, default=0.0)
+parser.add_argument("--safe-contact-threshold", type=float, default=1.0)
+parser.add_argument("--safe-orientation-limit", type=float, default=0.8)
+parser.add_argument("--progress-reward-scale", type=float, default=1.0)
+parser.add_argument("--success-reward", type=float, default=10.0)
+parser.add_argument("--macro-step-penalty", type=float, default=-0.01)
+parser.add_argument("--safe-dataset-dir", type=str, default=None)
 
 
 # r2r argparse arguments
@@ -60,6 +67,16 @@ args_cli = parser.parse_args()
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+
+import gymnasium as gym
+import imageio
+import numpy as np
+import torch
+from PIL import Image
+
+from safe_vln.actions import normalize_policy_response
+from safe_vln.dataset import SafeVLNShardWriter, write_episode_summary
+from safe_vln.trajectory import SafeTrajectoryRecorder
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -154,11 +171,10 @@ def add_measurement(env, episode):
     return
 
 
-def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query):
+def sample_eight_images(image_list):
     if len(image_list) == 0:
-        print("Did not receive any images.")
-        return None
-    elif len(image_list) < 8:
+        raise ValueError("Did not receive any images")
+    if len(image_list) < 8:
         print("Not enough images received, padding.")
         image_list = image_list.copy()
         # append image value=0, in front of the existing images, image size equal to the last one
@@ -166,11 +182,15 @@ def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query):
             image_list.insert(0, Image.new('RGB', image_list[-1].size, (0, 0, 0)))
     else:
         image_list = image_list.copy()
-        
     num_images = len(image_list)
     indices = [int(i * (num_images - 1) / 7) for i in range(7)]
     sampled_images = [image_list[i] for i in indices]
     sampled_images.append(image_list[-1])
+    return sampled_images
+
+
+def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query, request_metadata=None):
+    sampled_images = sample_eight_images(image_list)
 
     # save sampled images
     # time_stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -209,6 +229,8 @@ def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query):
         'images': encoded_images,
         'query': query
     }
+    if request_metadata:
+        request_data.update(request_metadata)
 
     # Send to VLM server
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -234,8 +256,169 @@ def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query):
         return response
 
 
+def _measurement_distance(infos):
+    return float(infos["measurements"]["distance_to_goal"])
+
+
+def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction, episode):
+    recorder = SafeTrajectoryRecorder(
+        episode_id=episode["episode_id"],
+        scene_id=episode["scene_id"],
+        instruction=instruction.instruction_text,
+        gamma=args_cli.safe_gamma,
+        progress_scale=args_cli.progress_reward_scale,
+        step_penalty=args_cli.macro_step_penalty,
+        success_reward=args_cli.success_reward,
+        cost_limit=args_cli.safe_cost_limit,
+    )
+    dataset_writer = None
+    dataset_samples = []
+    if args_cli.safe_dataset_dir:
+        dataset_writer = SafeVLNShardWriter(args_cli.safe_dataset_dir)
+
+    step_dt = env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation
+    steps_per_image = max(1, round(0.5 / step_dt))
+    steps_per_viz = max(1, round(0.1 / step_dt))
+    max_steps = round(100 * 0.5 / step_dt)
+    if args_cli.max_episode_seconds is not None:
+        max_steps = min(max_steps, round(args_cli.max_episode_seconds / step_dt))
+
+    num_steps = 0
+    vlm_calls = 0
+    terminal = False
+    termination_reason = None
+    try:
+        while simulation_app.is_running() and not terminal and num_steps < max_steps:
+            if args_cli.max_vlm_calls is not None and vlm_calls >= args_cli.max_vlm_calls:
+                termination_reason = "max_vlm_calls"
+                break
+
+            sampled_frames = sample_eight_images(image_observations)
+            response = sample_images_and_send_to_vlm(
+                image_observations,
+                args_cli.vlm_host,
+                args_cli.vlm_port,
+                instruction.instruction_text,
+                request_metadata={
+                    "protocol_version": "safe-vln-go2-v1",
+                    "mode": "act",
+                    "episode_id": str(episode["episode_id"]),
+                    "transition_index": len(recorder.transitions),
+                    "deterministic": True,
+                },
+            )
+            vlm_calls += 1
+            policy_output = normalize_policy_response(response)
+            action_text = policy_output["text"]
+            recorder.begin(policy_output, _measurement_distance(infos))
+            print(
+                f"Safe-VLN output: {response}\nAction {policy_output['action_id']}: {action_text}\n"
+                f"Command: {policy_output['velocity_command']}, duration: {policy_output['duration']:.2f}s\n",
+                flush=True,
+            )
+
+            if policy_output["action_id"] == 9:
+                env.set_stop_called(True)
+                env.measure_manager.update_measures()
+                infos["measurements"] = env.measure_manager.get_measurements()
+                success = bool(infos["measurements"]["success"])
+                recorder.finish(
+                    distance_after=_measurement_distance(infos),
+                    success=success,
+                    terminated=True,
+                    termination_reason="success" if success else "failed_stop",
+                )
+                terminal = True
+            else:
+                requested_steps = max(1, round(policy_output["duration"] / step_dt))
+                command = torch.tensor(policy_output["velocity_command"], device=obs.device)
+                for _ in range(requested_steps):
+                    obs, _, done, infos = env.step(command)
+                    recorder.count_env_step()
+                    num_steps += 1
+
+                    if num_steps % steps_per_image == 0:
+                        frame = infos["observations"]["camera_obs"][0, :, :, :3].cpu().numpy()
+                        image_observations.append(Image.fromarray(frame))
+                    if num_steps % steps_per_viz == 0:
+                        camera_frame = infos["observations"]["camera_obs"][0, :, :, :3].cpu().numpy().copy()
+                        viz_frame = infos["observations"]["viz_camera_obs"][0, :, :, :3].cpu().numpy().copy()
+                        add_instruction_on_img(camera_frame, instruction.instruction_text)
+                        add_instruction_on_img(viz_frame, action_text)
+                        rgb_obses.append(np.concatenate([camera_frame, viz_frame], axis=1))
+
+                    safety = infos.get("safety", {})
+                    if safety.get("cost", 0.0) > 0:
+                        termination_reason = safety["termination_reason"]
+                    elif done:
+                        termination_reason = "environment_termination"
+                    elif num_steps >= max_steps:
+                        termination_reason = "max_episode_steps"
+                    if termination_reason:
+                        terminal = True
+                        break
+
+                success = bool(infos["measurements"]["success"])
+                safety = infos.get("safety", {})
+                recorder.finish(
+                    distance_after=_measurement_distance(infos),
+                    success=success,
+                    unsafe_contact=bool(safety.get("unsafe_contact", False)),
+                    fall=bool(safety.get("fall", False)),
+                    terminated=terminal,
+                    truncated=termination_reason in {"max_episode_steps", "max_vlm_calls"},
+                    termination_reason=termination_reason,
+                )
+
+            transition = recorder.transitions[-1]
+            transition["episode_id"] = str(episode["episode_id"])
+            transition["scene_id"] = episode["scene_id"]
+            transition["instruction"] = instruction.instruction_text
+            transition["observation_key"] = f"episode{episode['episode_id']}/state{transition['index']:06d}"
+            transition["next_observation_key"] = (
+                None if transition["done"] else f"episode{episode['episode_id']}/state{transition['index'] + 1:06d}"
+            )
+            if dataset_writer is not None:
+                dataset_samples.append((transition["observation_key"], sampled_frames, transition))
+    finally:
+        if recorder.transitions and not recorder.transitions[-1].get("done") and termination_reason == "max_vlm_calls":
+            recorder.transitions[-1]["done"] = True
+            recorder.transitions[-1]["truncated"] = True
+            recorder.transitions[-1]["termination_reason"] = termination_reason
+        recorder.finalize()
+        if dataset_writer is not None:
+            for sample_key, frames, metadata in dataset_samples:
+                dataset_writer.add(sample_key, frames, metadata)
+            dataset_writer.close()
+            write_episode_summary(args_cli.safe_dataset_dir, recorder.to_dict(infos.get("measurements", {})))
+    return infos, rgb_obses, recorder
+
+
+def save_evaluation_outputs(env, episode, measurements, rgb_obses, trajectory=None):
+    result_dir = f"eval_results/{args_cli.task}_loco_{args_cli.load_run}"
+    measurement_dir = os.path.join(result_dir, "measurements")
+    video_dir = os.path.join(result_dir, "videos")
+    os.makedirs(measurement_dir, exist_ok=True)
+    os.makedirs(video_dir, exist_ok=True)
+    output_index = int(episode["episode_id"]) - 1
+    with open(f"{measurement_dir}/{output_index}.json", "w") as file:
+        json.dump(measurements, file, indent=4)
+    if trajectory is not None:
+        trajectory_dir = os.path.join(result_dir, "safe_trajectories")
+        os.makedirs(trajectory_dir, exist_ok=True)
+        with open(f"{trajectory_dir}/{output_index}.json", "w") as file:
+            json.dump(trajectory, file, indent=2)
+    writer = imageio.get_writer(f"{video_dir}/output_{output_index}.mp4", fps=10)
+    for frame in rgb_obses:
+        writer.append_data(frame.astype(np.uint8))
+    writer.close()
+
+
 def main():
     """IsaacSim Evaluation using NaViLA and trained low-level policy."""
+
+    if args_cli.safe_vln and args_cli.task != "go2_matterport_vision":
+        raise ValueError("Safe-VLN supports only --task=go2_matterport_vision")
 
     # read R2R test episodes
     r2r_data_path = os.path.join(ASSETS_DIR, "vln_ce_isaac_v1.json.gz")
@@ -243,6 +426,12 @@ def main():
     episode = all_episodes[args_cli.episode_idx]
 
     env_cfg = parse_env_cfg(args_cli.task, num_envs=args_cli.num_envs)
+
+    if args_cli.safe_vln:
+        # ManagerBasedRLEnv resets terminated environments inside step(). The
+        # high-level wrapper must observe and record the terminal Go2 pose first.
+        env_cfg.terminations.base_contact = None
+        env_cfg.terminations.bad_orientation = None
 
     # reset the position and rotation of the robot
     env_cfg = reset_start_pos_rot(env_cfg, args_cli, episode)
@@ -283,7 +472,9 @@ def main():
 
     all_measures = ["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]
     env = VLNEnvWrapper(env, policy, args_cli.task, episode, high_level_obs_key="camera_obs",
-                        measure_names=all_measures)
+                        measure_names=all_measures, safe_vln=args_cli.safe_vln,
+                        contact_threshold=args_cli.safe_contact_threshold,
+                        orientation_limit=args_cli.safe_orientation_limit)
     
     # set view pos and target
     robot_pos_w = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
@@ -313,6 +504,17 @@ def main():
     # vis_frame = cv2.rotate(vis_frame, cv2.ROTATE_90_CLOCKWISE)
     add_instruction_on_img(vis_frame, "")
     rgb_obses = [np.concatenate([init_frame, vis_frame], axis=1)]
+
+    if args_cli.safe_vln:
+        infos, rgb_obses, recorder = run_safe_episode(
+            env, obs, infos, image_observations, rgb_obses, instruction, episode
+        )
+        measurements = dict(infos["measurements"])
+        measurements.update(recorder.summary(measurements))
+        trajectory = recorder.to_dict(measurements)
+        save_evaluation_outputs(env, episode, measurements, rgb_obses, trajectory)
+        env.close()
+        return
 
     num_steps = 0
     target_steps = 0
@@ -370,27 +572,7 @@ def main():
         #     visualizer.visualize(reference_path_isaac)
     measurements = infos["measurements"]
 
-    result_dir = f"eval_results/{args_cli.task}_loco_{args_cli.load_run}"
-    if not os.path.exists(result_dir):
-        os.makedirs(result_dir)
-
-    measurement_dir = os.path.join(result_dir, "measurements")
-    if not os.path.exists(measurement_dir):
-        os.makedirs(measurement_dir)
-    with open(f"{measurement_dir}/{int(episode['episode_id'])-1}.json", "w") as f:
-        json.dump(measurements, f, indent=4)
-
-
-    video_dir = os.path.join(result_dir, "videos")
-    if not os.path.exists(video_dir):
-        os.makedirs(video_dir)
-
-    writer = imageio.get_writer(f"{video_dir}/output_{int(episode['episode_id'])-1}.mp4", fps=10)
-    for frame in rgb_obses:
-        frame = frame.astype(np.uint8)
-        writer.append_data(frame)
-
-    writer.close()
+    save_evaluation_outputs(env, episode, measurements, rgb_obses)
 
     # close the simulator
     env.close()

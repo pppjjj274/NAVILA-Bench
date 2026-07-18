@@ -31,6 +31,8 @@ from llava.constants import IMAGE_TOKEN_INDEX
 from llava.conversation import SeparatorStyle, conv_templates
 # 中文注释: 导入 NaVILA/LLaVA 的模型加载函数，用 checkpoint 路径创建 tokenizer、模型和 image_processor。
 from llava.model.builder import load_pretrained_model
+from safe_vln.actions import action_from_id
+from safe_vln.model import SafeNavilaActorCritic
 
 
 # 中文注释: 定义 VLMServer 类；它负责加载 NaVILA 模型，并通过 TCP 接收图像+指令后返回动作文本。
@@ -50,8 +52,24 @@ class VLMServer:
         self.image_processor = None
         # 中文注释: 预留视觉塔引用；当前逻辑没有直接使用，但保留这个字段方便扩展或调试模型结构。
         self.vision_tower = None
+        self.safe_model = None
         # 中文注释: 立即执行模型加载和初始化，让服务开始监听前就准备好推理所需资源。
         self.setup()
+        if getattr(args, "safe_checkpoint", None):
+            self._load_safe_checkpoint(args.safe_checkpoint)
+
+    def _load_safe_checkpoint(self, checkpoint_path):
+        """Load a LoRA adapter and the two Safe-VLN critic heads."""
+        try:
+            from peft import PeftModel
+        except ImportError as exc:
+            raise RuntimeError("PEFT is required to load a Safe-VLN checkpoint") from exc
+        adapter_config = os.path.join(checkpoint_path, "adapter_config.json")
+        if os.path.exists(adapter_config):
+            self.model = PeftModel.from_pretrained(self.model, checkpoint_path)
+        self.safe_model = SafeNavilaActorCritic(self.model, self.tokenizer).to(self.args.device)
+        self.safe_model.load_safe_heads(checkpoint_path, map_location=self.args.device)
+        self.safe_model.eval()
 
     # 中文注释: 定义 setup 方法；它完成一次性初始化，避免每个请求都重复加载大模型。
     def setup(self):
@@ -275,6 +293,20 @@ class VLMServer:
         stopping_criteria = KeywordsStoppingCriteria(keywords, self.tokenizer, input_ids)
 
         # 中文注释: 进入 inference_mode，关闭梯度和 autograd 记录，降低推理显存和计算开销。
+        if self.safe_model is not None:
+            with torch.inference_mode():
+                safe_output = self.safe_model.act(
+                    input_ids,
+                    images=[image_tensor],
+                    deterministic=getattr(self.args, "safe_deterministic", True),
+                )
+            action = action_from_id(safe_output["action_id"])
+            return {
+                "protocol_version": "safe-vln-go2-v1",
+                **safe_output,
+                "action": action.text,
+            }
+
         with torch.inference_mode():
             # 中文注释: 记录生成开始时间，用于统计本次 VLM 推理耗时。
             start_time = time.time()
@@ -373,6 +405,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda")
     # 中文注释: 注册 --num_video_frames 参数，控制 prompt 中历史帧+当前帧的图像 token 数量。
     parser.add_argument("--num_video_frames", type=int, default=8)
+    parser.add_argument("--safe_checkpoint", type=str, default=None)
+    parser.add_argument("--safe_deterministic", action=argparse.BooleanOptionalAction, default=True)
     # 中文注释: 解析命令行参数，并保存为全局 args；注意 _load_checkpoint_w16a16 里也直接引用了这个全局变量。
     args = parser.parse_args()
     
