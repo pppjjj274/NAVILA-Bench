@@ -21,6 +21,11 @@ import torch
 import numpy as np
 
 from rsl_rl.env import VecEnv
+from safe_vln.safety import (
+    BlockedDetector,
+    orientation_angle as compute_orientation_angle,
+    unsafe_contact_diagnostics,
+)
 
 from omni.isaac.lab.envs import DirectRLEnv, ManagerBasedRLEnv
 from omni.isaac.lab_tasks.utils.wrappers.rsl_rl import RslRlVecEnvWrapper
@@ -134,6 +139,7 @@ class VLNEnvWrapper:
                  low_level_policy, task_name,
                  episode, max_length=10000, high_level_obs_key="camera_obs",
                  safe_vln=False, contact_threshold=1.0, orientation_limit=0.8,
+                 blocked_seconds=2.0, blocked_distance=0.1,
                  measure_names=["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]
         ):
         self.env = env
@@ -145,6 +151,15 @@ class VLNEnvWrapper:
         self.safe_vln = safe_vln
         self.contact_threshold = float(contact_threshold)
         self.orientation_limit = float(orientation_limit)
+        self.blocked_seconds = float(blocked_seconds)
+        if self.blocked_seconds <= 0:
+            raise ValueError("blocked_seconds must be positive")
+        step_dt = float(self.unwrapped.cfg.sim.dt * self.unwrapped.cfg.decimation)
+        self.blocked_window_steps = max(1, round(self.blocked_seconds / step_dt))
+        self.blocked_detector = BlockedDetector(
+            window_steps=self.blocked_window_steps,
+            min_displacement=float(blocked_distance),
+        )
         self.last_safety = self._empty_safety()
 
         self.env_step = 0
@@ -164,40 +179,63 @@ class VLNEnvWrapper:
         return {
             "unsafe_contact": False,
             "fall": False,
+            "blocked": False,
             "cost": 0.0,
             "termination_reason": None,
+            "contact_bodies": [],
+            "contact_body_forces": {},
+            "max_unsafe_contact_force": 0.0,
+            "orientation_angle": 0.0,
+            "blocked_steps": 0,
+            "blocked_displacement": 0.0,
         }
 
-    def _compute_go2_safety(self):
+    def _compute_go2_safety(self, action, previous_position, current_position):
         """Read post-physics Go2 safety state before any high-level reset."""
         if not self.safe_vln:
             return self._empty_safety()
 
         contact_sensor = self.unwrapped.scene.sensors["contact_forces"]
-        body_ids, _ = contact_sensor.find_bodies("base")
-        if not body_ids:
-            raise RuntimeError("Go2 contact sensor does not expose the base body")
-        forces = contact_sensor.data.net_forces_w_history[:, :, body_ids]
-        max_force = torch.norm(forces, dim=-1).amax(dim=(1, 2))
-        unsafe_contact = bool((max_force[0] > self.contact_threshold).item())
+        unsafe_contact, contact_body_forces, max_contact_force = (
+            unsafe_contact_diagnostics(
+                contact_sensor.body_names,
+                contact_sensor.data.net_forces_w_history[0],
+                self.contact_threshold,
+            )
+        )
 
         projected_gravity = self.unwrapped.scene["robot"].data.projected_gravity_b
-        gravity_z = torch.clamp(-projected_gravity[0, 2], -1.0, 1.0)
-        orientation = torch.acos(gravity_z).abs()
-        fall = bool((orientation > self.orientation_limit).item())
+        orientation = compute_orientation_angle(projected_gravity[0])
+        fall = orientation > self.orientation_limit
+
+        if unsafe_contact or fall:
+            self.blocked_detector.reset()
+            blocked_status = None
+        else:
+            blocked_status = self.blocked_detector.update(
+                action, previous_position, current_position
+            )
+        blocked = bool(blocked_status and blocked_status.blocked)
 
         reasons = []
         if unsafe_contact:
             reasons.append("unsafe_contact")
         if fall:
             reasons.append("fall")
+        if blocked:
+            reasons.append("blocked")
         return {
             "unsafe_contact": unsafe_contact,
             "fall": fall,
-            "cost": float(unsafe_contact) + float(fall),
+            "blocked": blocked,
+            "cost": float(unsafe_contact) + float(fall) + float(blocked),
             "termination_reason": "+".join(reasons) or None,
-            "base_contact_force": float(max_force[0].item()),
-            "orientation_angle": float(orientation.item()),
+            "contact_bodies": sorted(contact_body_forces),
+            "contact_body_forces": contact_body_forces,
+            "max_unsafe_contact_force": max_contact_force,
+            "orientation_angle": orientation,
+            "blocked_steps": blocked_status.observed_steps if blocked_status else 0,
+            "blocked_displacement": blocked_status.displacement if blocked_status else 0.0,
         }
 
     @property
@@ -235,6 +273,7 @@ class VLNEnvWrapper:
             self.low_level_action = actions
 
         self.env_step, self.same_pos_count = 0, 0
+        self.blocked_detector.reset()
         self.last_safety = self._empty_safety()
 
         self.set_measures()
@@ -242,7 +281,7 @@ class VLNEnvWrapper:
         measurements = self.measure_manager.get_measurements()
         infos["measurements"] = measurements
 
-        self.prev_pos = self.env.unwrapped.scene["robot"].data.root_pos_w[0].detach()
+        self.prev_pos = self.env.unwrapped.scene["robot"].data.root_pos_w[0].detach().clone()
 
         obs = infos["observations"][self.high_level_obs_key]
         return obs, infos
@@ -285,14 +324,33 @@ class VLNEnvWrapper:
         obs = info["observations"][self.high_level_obs_key]
         self.env_step += 1
 
-        self.last_safety = self._compute_go2_safety()
+        current_pos = self.unwrapped.scene["robot"].data.root_pos_w[0].detach()
+        if self.safe_vln:
+            self.last_safety = self._compute_go2_safety(
+                action, self.prev_pos, current_pos
+            )
+            same_pos = False
+            self.prev_pos = current_pos.clone()
+        else:
+            self.last_safety = self._empty_safety()
+            same_pos = self.check_same_pos()
+        if self.last_safety["cost"] > 0.0:
+            print(
+                "[SAFE-VLN] terminating "
+                f"reason={self.last_safety['termination_reason']} "
+                f"contact_bodies={self.last_safety['contact_bodies']} "
+                f"max_force={self.last_safety['max_unsafe_contact_force']:.3f}N "
+                f"orientation={self.last_safety['orientation_angle']:.3f}rad "
+                f"blocked_steps={self.last_safety['blocked_steps']} "
+                f"blocked_displacement={self.last_safety['blocked_displacement']:.3f}m"
+            )
+
+
         self.measure_manager.update_measures()
         measurements = self.measure_manager.get_measurements()
         info["measurements"] = measurements
         info["safety"] = self.last_safety
 
-        # Check if the robot has stayed in the same location for 1000 steps or env has reached max length
-        same_pos = self.check_same_pos()
         done = (
             done[0]
             or self.last_safety["cost"] > 0.0
@@ -310,7 +368,7 @@ class VLNEnvWrapper:
             self.same_pos_count += 1
         else:
             self.same_pos_count = 0
-        self.prev_pos = curr_pos
+        self.prev_pos = curr_pos.clone()
 
         # Break out of the loop if the robot has stayed in the same location for 1000 steps
         if self.same_pos_count >= 1000:

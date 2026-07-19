@@ -57,6 +57,30 @@ def test_trajectory_separates_collision_cost_from_reward():
     assert recorder.summary({"success": 0.0})["constraint_satisfied"] is False
 
 
+def test_trajectory_records_blocked_as_terminal_cost():
+    recorder = SafeTrajectoryRecorder(
+        episode_id="1", scene_id="scene", instruction="go", cost_limit=0.0
+    )
+    recorder.begin(normalize_policy_response({"action_id": 8}), 5.0)
+    recorder.count_env_step()
+    item = recorder.finish(
+        distance_after=5.0,
+        blocked=True,
+        safety_diagnostics={"blocked_steps": 100, "blocked_displacement": 0.01},
+        terminated=True,
+        termination_reason="blocked",
+    )
+    recorder.finalize()
+
+    assert item["cost"] == 1.0
+    assert item["cost_components"]["blocked"] == 1.0
+    assert item["safety_diagnostics"]["blocked_steps"] == 100
+    assert item["termination_reason"] == "blocked"
+    assert recorder.transitions[0]["cost_return"] == 1.0
+    assert recorder.summary()["blocked_count"] == 1.0
+    assert recorder.summary()["has_blocked"] is True
+
+
 def test_constrained_ppo_loss_is_finite_and_backpropagates():
     new_log_probs = torch.tensor([-0.2, -0.4], requires_grad=True)
     reward_values = torch.tensor([0.1, 0.2], requires_grad=True)

@@ -39,6 +39,8 @@ import omni.isaac.core.utils.prims as prim_utils
 import torch
 from omni.isaac.core.objects import VisualCuboid
 
+from safe_vln.checkpoint import load_go2_inference_checkpoint
+
 import gymnasium as gym
 from omni.isaac.lab.sensors.camera.utils import create_pointcloud_from_depth
 from omni.isaac.lab.markers.config import CUBOID_MARKER_CFG
@@ -322,7 +324,9 @@ if __name__ == "__main__":
     resume_path = get_checkpoint_path(log_root_path, args_cli.load_run, agent_cfg.load_checkpoint)
 
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)  # Adjust device as needed
-    ppo_runner.load(resume_path)
+    load_go2_inference_checkpoint(
+        ppo_runner, resume_path, map_location=agent_cfg.device
+    )
 
     low_level_policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 

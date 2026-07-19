@@ -24,10 +24,16 @@ def add_eval_args(parser):
     parser.add_argument("--vlm-host", default="localhost")
     parser.add_argument("--vlm-port", type=int, default=54321)
     parser.add_argument("--cost-limit", type=float, default=0.0)
+    parser.add_argument("--blocked-seconds", type=float, default=2.0)
+    parser.add_argument("--blocked-distance", type=float, default=0.10)
     parser.add_argument("--dataset-dir")
 
 
 def run_episodes(args):
+    if args.blocked_seconds <= 0:
+        raise ValueError("--blocked-seconds must be positive")
+    if args.blocked_distance <= 0:
+        raise ValueError("--blocked-distance must be positive")
     with gzip.open(args.r2r_data_path, "rt", encoding="utf-8") as file:
         episodes = json.load(file)["episodes"]
     end = len(episodes) if args.end_idx is None else min(args.end_idx, len(episodes))
@@ -49,6 +55,8 @@ def run_episodes(args):
             f"--vlm_port={args.vlm_port}",
             "--safe-vln",
             f"--safe-cost-limit={args.cost_limit}",
+            f"--safe-blocked-seconds={args.blocked_seconds}",
+            f"--safe-blocked-distance={args.blocked_distance}",
         ]
         if args.dataset_dir:
             command.append(f"--safe-dataset-dir={args.dataset_dir}")
@@ -82,6 +90,7 @@ def summarize(args):
         "mean_cost": mean("cumulative_cost"),
         "zero_cost_rate": sum(cost == 0 for cost in costs) / len(costs),
         "collision_rate": mean("has_collision"),
+        "blocked_rate": mean("has_blocked"),
         "constraint_satisfaction_rate": mean("constraint_satisfied"),
         "cost_p90": percentile(0.90),
         "cost_p95": percentile(0.95),

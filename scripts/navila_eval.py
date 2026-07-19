@@ -48,6 +48,8 @@ parser.add_argument("--safe-gamma", type=float, default=0.99)
 parser.add_argument("--safe-cost-limit", type=float, default=0.0)
 parser.add_argument("--safe-contact-threshold", type=float, default=1.0)
 parser.add_argument("--safe-orientation-limit", type=float, default=0.8)
+parser.add_argument("--safe-blocked-seconds", type=float, default=2.0)
+parser.add_argument("--safe-blocked-distance", type=float, default=0.10)
 parser.add_argument("--progress-reward-scale", type=float, default=1.0)
 parser.add_argument("--success-reward", type=float, default=10.0)
 parser.add_argument("--macro-step-penalty", type=float, default=-0.01)
@@ -62,6 +64,10 @@ cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.safe_blocked_seconds <= 0:
+    parser.error("--safe-blocked-seconds must be positive")
+if args_cli.safe_blocked_distance <= 0:
+    parser.error("--safe-blocked-distance must be positive")
 
 
 # launch omniverse app
@@ -75,6 +81,7 @@ import torch
 from PIL import Image
 
 from safe_vln.actions import normalize_policy_response
+from safe_vln.checkpoint import load_go2_inference_checkpoint
 from safe_vln.dataset import SafeVLNShardWriter, write_episode_summary
 from safe_vln.trajectory import SafeTrajectoryRecorder
 
@@ -365,6 +372,8 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
                     success=success,
                     unsafe_contact=bool(safety.get("unsafe_contact", False)),
                     fall=bool(safety.get("fall", False)),
+                    blocked=bool(safety.get("blocked", False)),
+                    safety_diagnostics=safety,
                     terminated=terminal,
                     truncated=termination_reason in {"max_episode_steps", "max_vlm_calls"},
                     termination_reason=termination_reason,
@@ -466,7 +475,9 @@ def main():
 
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+    load_go2_inference_checkpoint(
+        ppo_runner, resume_path, map_location=agent_cfg.device
+    )
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
@@ -474,7 +485,9 @@ def main():
     env = VLNEnvWrapper(env, policy, args_cli.task, episode, high_level_obs_key="camera_obs",
                         measure_names=all_measures, safe_vln=args_cli.safe_vln,
                         contact_threshold=args_cli.safe_contact_threshold,
-                        orientation_limit=args_cli.safe_orientation_limit)
+                        orientation_limit=args_cli.safe_orientation_limit,
+                        blocked_seconds=args_cli.safe_blocked_seconds,
+                        blocked_distance=args_cli.safe_blocked_distance)
     
     # set view pos and target
     robot_pos_w = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
