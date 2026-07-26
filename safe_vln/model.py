@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
 from torch import nn
 
-from .actions import ACTIONS
+from .actions import ACTIONS, NAVILA_ACTION_RESPONSES
 
 
 @dataclass
@@ -62,13 +63,124 @@ class SafeNavilaActorCritic(nn.Module):
         self.reward_head = ValueHead(int(hidden_size))
         self.cost_head = ValueHead(int(hidden_size))
         self._candidate_ids = [
-            tokenizer(action.text, add_special_tokens=False, return_tensors="pt").input_ids[0]
-            for action in ACTIONS
+            tokenizer(text, add_special_tokens=False, return_tensors="pt").input_ids[0]
+            for text in NAVILA_ACTION_RESPONSES
         ]
         if any(candidate.numel() == 0 for candidate in self._candidate_ids):
             raise ValueError("every canonical Safe-VLN action must tokenize to at least one token")
 
-    def _forward_base(self, input_ids, attention_mask, images=None, **model_kwargs):
+    def _navila_model(self):
+        model = self.base_model
+        if hasattr(model, "get_base_model"):
+            model = model.get_base_model()
+        if (
+            hasattr(model, "prepare_inputs_labels_for_multimodal")
+            and hasattr(model, "llm")
+        ):
+            return model
+        return None
+
+    def _encode_navila_images_once(self, images):
+        navila_model = self._navila_model()
+        if navila_model is None or images is None:
+            return None
+        flattened = images
+        if type(flattened) is list:
+            flattened = torch.cat(flattened, dim=0)
+        elif flattened.ndim == 5:
+            flattened = flattened.flatten(0, 1)
+        # The Safe-VLN LoRA adapters live in the language model.  The vision
+        # tower and projector remain frozen, so their features can be shared
+        # by all ten candidate actions without retaining an autograd graph.
+        if hasattr(navila_model, "freezed_module_patch"):
+            navila_model.freezed_module_patch()
+        with torch.no_grad():
+            return navila_model.encode_images(flattened).to(
+                next(self.base_model.parameters()).device
+            ).detach()
+
+    def _forward_base(
+        self,
+        input_ids,
+        attention_mask,
+        images=None,
+        image_features=None,
+        output_suffix_length=None,
+        **model_kwargs,
+    ):
+        # NaViLA's outer LlavaLlamaModel.forward is coupled to its original
+        # distributed language-model training loop: it expects time-token
+        # config fields and always rescales a supervised LM loss.  Safe-VLN
+        # needs logits/hidden states without LM labels, so prepare the same
+        # multimodal embeddings and call the inner Llama directly.  PEFT
+        # injects LoRA layers into this inner module, hence actor gradients are
+        # retained during constrained PPO.
+        navila_model = self._navila_model()
+        if navila_model is not None:
+            if hasattr(navila_model, "freezed_module_patch"):
+                navila_model.freezed_module_patch()
+            original_encode_images = None
+            if image_features is not None:
+                original_encode_images = navila_model.encode_images
+                navila_model.encode_images = lambda unused_images: image_features
+            try:
+                (
+                    prepared_input_ids,
+                    position_ids,
+                    prepared_attention_mask,
+                    past_key_values,
+                    inputs_embeds,
+                    _,
+                ) = navila_model.prepare_inputs_labels_for_multimodal(
+                    input_ids,
+                    None,
+                    attention_mask,
+                    None,
+                    None,
+                    images,
+                )
+            finally:
+                if original_encode_images is not None:
+                    navila_model.encode_images = original_encode_images
+            model_kwargs.setdefault("use_cache", False)
+            if (
+                output_suffix_length is not None
+                and hasattr(navila_model.llm, "model")
+                and hasattr(navila_model.llm, "lm_head")
+            ):
+                # LlamaForCausalLM normally materializes vocabulary logits for
+                # every visual/text position and, with output_hidden_states,
+                # retains every decoder layer.  Candidate scoring only needs
+                # the final candidate tokens, so keep the backbone's final
+                # state and project that small suffix through lm_head.
+                backbone_output = navila_model.llm.model(
+                    input_ids=prepared_input_ids,
+                    attention_mask=prepared_attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    output_hidden_states=False,
+                    return_dict=True,
+                    **model_kwargs,
+                )
+                suffix_hidden = backbone_output.last_hidden_state[
+                    :, -output_suffix_length:
+                ]
+                suffix_logits = navila_model.llm.lm_head(suffix_hidden).float()
+                return SimpleNamespace(
+                    logits=suffix_logits,
+                    hidden_states=(suffix_hidden,),
+                )
+            return navila_model.llm.forward(
+                input_ids=prepared_input_ids,
+                attention_mask=prepared_attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                output_hidden_states=True,
+                return_dict=True,
+                **model_kwargs,
+            )
         return self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -84,6 +196,7 @@ class SafeNavilaActorCritic(nn.Module):
         prompt_input_ids = prompt_input_ids.to(next(self.base_model.parameters()).device)
         candidate_scores = []
         state_hidden = None
+        image_features = self._encode_navila_images_once(images)
         for candidate in self._candidate_ids:
             candidate = candidate.to(prompt_input_ids.device)
             full_ids = torch.cat((prompt_input_ids, candidate.unsqueeze(0)), dim=1)
@@ -91,6 +204,8 @@ class SafeNavilaActorCritic(nn.Module):
                 full_ids,
                 torch.ones_like(full_ids),
                 images=images,
+                image_features=image_features,
+                output_suffix_length=candidate.numel() + 1,
                 **model_kwargs,
             )
             candidate_length = candidate.numel()

@@ -86,14 +86,25 @@ class SafeVLNShardWriter:
 
     def close(self) -> None:
         self.close_shard()
+        completed_shards = sorted(
+            self.output_dir.glob(f"{self.split}-*.tar")
+        )
+        total_samples = 0
+        for shard_path in completed_shards:
+            with tarfile.open(shard_path, "r") as archive:
+                total_samples += sum(
+                    member.isfile() and member.name.endswith(".json")
+                    for member in archive
+                )
         manifest_path = self.output_dir / "manifest.json"
         manifest_path.write_text(
             json.dumps(
                 {
                     "schema_version": "safe-vln-go2-v1",
                     "split": self.split,
-                    "completed_shards": len(list(self.output_dir.glob(f"{self.split}-*.tar"))),
+                    "completed_shards": len(completed_shards),
                     "samples_written_this_run": self.total_samples,
+                    "total_samples": total_samples,
                 },
                 indent=2,
             ),

@@ -53,6 +53,7 @@ class VLMServer:
         # 中文注释: 预留视觉塔引用；当前逻辑没有直接使用，但保留这个字段方便扩展或调试模型结构。
         self.vision_tower = None
         self.safe_model = None
+        self.safe_policy_version = None
         # 中文注释: 立即执行模型加载和初始化，让服务开始监听前就准备好推理所需资源。
         self.setup()
         if getattr(args, "safe_checkpoint", None):
@@ -70,6 +71,15 @@ class VLMServer:
         self.safe_model = SafeNavilaActorCritic(self.model, self.tokenizer).to(self.args.device)
         self.safe_model.load_safe_heads(checkpoint_path, map_location=self.args.device)
         self.safe_model.eval()
+        trainer_state_path = os.path.join(checkpoint_path, "trainer_state.json")
+        if os.path.exists(trainer_state_path):
+            with open(trainer_state_path, "r", encoding="utf-8") as state_file:
+                trainer_state = json.load(state_file)
+            self.safe_policy_version = int(
+                trainer_state.get("policy_version", 0)
+            )
+        else:
+            self.safe_policy_version = 0
 
     # 中文注释: 定义 setup 方法；它完成一次性初始化，避免每个请求都重复加载大模型。
     def setup(self):
@@ -304,6 +314,7 @@ class VLMServer:
             return {
                 "protocol_version": "safe-vln-go2-v1",
                 **safe_output,
+                "policy_version": self.safe_policy_version,
                 "action": action.text,
             }
 

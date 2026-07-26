@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -27,6 +28,65 @@ def add_eval_args(parser):
     parser.add_argument("--blocked-seconds", type=float, default=2.0)
     parser.add_argument("--blocked-distance", type=float, default=0.10)
     parser.add_argument("--dataset-dir")
+    parser.add_argument("--safe-replay", action="store_true")
+    parser.add_argument("--safe-replay-root")
+    parser.add_argument("--safe-replay-annotations")
+    parser.add_argument("--safe-replay-id", type=int)
+    parser.add_argument("--safe-replay-ids", type=int, nargs="+")
+    parser.add_argument("--safe-policy-tag")
+    parser.add_argument("--max-vlm-calls", type=int)
+    parser.add_argument("--max-episode-seconds", type=float)
+
+
+def _python_launcher():
+    loader = os.environ.get("GLIBC_LOADER")
+    glibc_lib = os.environ.get("GLIBC_LIB")
+    if loader and glibc_lib:
+        conda_prefix = os.environ.get("CONDA_PREFIX", sys.prefix)
+        library_path = (
+            f"{glibc_lib}:{conda_prefix}/lib:/lib64:/usr/lib64"
+        )
+        return [loader, "--library-path", library_path, sys.executable]
+    return [sys.executable]
+
+
+def _resolve_episode_plan(args, episode_count):
+    if args.safe_replay:
+        replay_ids = (
+            list(args.safe_replay_ids)
+            if args.safe_replay_ids is not None
+            else (
+                [args.safe_replay_id]
+                if args.safe_replay_id is not None
+                else []
+            )
+        )
+        if args.safe_replay_id is not None and args.safe_replay_ids is not None:
+            raise ValueError(
+                "use only one of --safe-replay-id and --safe-replay-ids"
+            )
+        if not replay_ids:
+            raise ValueError(
+                "--safe-replay requires --safe-replay-id or --safe-replay-ids"
+            )
+        end = args.start_idx + len(replay_ids)
+        if args.end_idx is not None and args.end_idx != end:
+            raise ValueError(
+                "--end-idx must equal --start-idx plus the number of "
+                "Safe-Replay IDs"
+            )
+        if end > episode_count:
+            raise ValueError("Safe-Replay physical episode range is out of bounds")
+        return replay_ids, end
+
+    if args.safe_replay_id is not None or args.safe_replay_ids is not None:
+        raise ValueError("replay IDs require --safe-replay")
+    end = (
+        episode_count
+        if args.end_idx is None
+        else min(args.end_idx, episode_count)
+    )
+    return None, end
 
 
 def run_episodes(args):
@@ -34,22 +94,30 @@ def run_episodes(args):
         raise ValueError("--blocked-seconds must be positive")
     if args.blocked_distance <= 0:
         raise ValueError("--blocked-distance must be positive")
+    if args.max_vlm_calls is not None and args.max_vlm_calls <= 0:
+        raise ValueError("--max-vlm-calls must be positive")
+    if args.max_episode_seconds is not None and args.max_episode_seconds <= 0:
+        raise ValueError("--max-episode-seconds must be positive")
     with gzip.open(args.r2r_data_path, "rt", encoding="utf-8") as file:
         episodes = json.load(file)["episodes"]
-    end = len(episodes) if args.end_idx is None else min(args.end_idx, len(episodes))
+    replay_ids, end = _resolve_episode_plan(args, len(episodes))
+    if args.safe_replay:
+        if args.safe_replay_root is None:
+            raise ValueError(
+                "--safe-replay requires --safe-replay-root"
+            )
     if not 0 <= args.start_idx < end:
         raise ValueError("invalid episode range")
 
     for index in range(args.start_idx, end):
         command = [
-            sys.executable,
+            *_python_launcher(),
             "scripts/navila_eval.py",
             "--task=go2_matterport_vision",
             "--num_envs=1",
             "--history_length=9",
             f"--load_run={args.low_level_policy_dir}",
             "--headless",
-            "--enable_cameras",
             f"--episode_idx={index}",
             f"--vlm_host={args.vlm_host}",
             f"--vlm_port={args.vlm_port}",
@@ -58,8 +126,31 @@ def run_episodes(args):
             f"--safe-blocked-seconds={args.blocked_seconds}",
             f"--safe-blocked-distance={args.blocked_distance}",
         ]
+        if args.safe_replay:
+            replay_id = replay_ids[index - args.start_idx]
+            command.extend(
+                [
+                    "--safe-replay",
+                    f"--safe-replay-root={args.safe_replay_root}",
+                    f"--safe-replay-id={replay_id}",
+                ]
+            )
+            if args.safe_replay_annotations:
+                command.append(
+                    f"--safe-replay-annotations={args.safe_replay_annotations}"
+                )
+            if args.safe_policy_tag:
+                command.append(f"--safe-policy-tag={args.safe_policy_tag}")
+        else:
+            command.append("--enable_cameras")
         if args.dataset_dir:
             command.append(f"--safe-dataset-dir={args.dataset_dir}")
+        if args.max_vlm_calls is not None:
+            command.append(f"--max_vlm_calls={args.max_vlm_calls}")
+        if args.max_episode_seconds is not None:
+            command.append(
+                f"--max_episode_seconds={args.max_episode_seconds}"
+            )
         completed = subprocess.run(command, check=False)
         if completed.returncode:
             return completed.returncode
@@ -108,6 +199,11 @@ def add_model_args(parser, *, train=False):
     parser.add_argument("--checkpoint")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--training-dtype",
+        choices=("bfloat16", "float16"),
+        default="bfloat16",
+    )
     parser.add_argument("--split", default="train")
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--max-samples", type=int)

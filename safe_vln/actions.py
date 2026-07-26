@@ -35,6 +35,23 @@ ACTIONS: tuple[SafeAction, ...] = (
     SafeAction(9, "stop", (0.0, 0.0, 0.0), 0.0),
 )
 
+# Text sequences used by the original NaViLA R2R action supervision.  The
+# executable action remains the local SafeAction above; these strings are only
+# used to score the ten discrete choices with the causal language model.
+NAVILA_ACTION_RESPONSES: tuple[str, ...] = (
+    "The next action is turn left 15 degree.",
+    "The next action is turn left 30 degree.",
+    "The next action is turn left 45 degree.",
+    "The next action is turn right 15 degree.",
+    "The next action is turn right 30 degree.",
+    "The next action is turn right 45 degree.",
+    "The next action is move forward 25 cm.",
+    "The next action is move forward 50 cm.",
+    "The next action is move forward 75 cm.",
+    "I think I should stop because I have finished the instruction.",
+)
+assert len(NAVILA_ACTION_RESPONSES) == len(ACTIONS)
+
 
 def action_from_id(action_id: int) -> SafeAction:
     if isinstance(action_id, bool) or not isinstance(action_id, int):
@@ -77,6 +94,22 @@ def _finite_optional_float(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _action_probabilities(value: Any) -> list[float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != len(ACTIONS):
+        return None
+    try:
+        probabilities = [float(item) for item in value]
+    except (TypeError, ValueError):
+        return None
+    if (
+        any(not math.isfinite(item) or item < 0.0 for item in probabilities)
+        or sum(probabilities) <= 0.0
+    ):
+        return None
+    total = sum(probabilities)
+    return [item / total for item in probabilities]
+
+
 def normalize_policy_response(response: Any) -> dict[str, Any]:
     """Normalize legacy text and structured Safe-VLN policy responses.
 
@@ -104,6 +137,11 @@ def normalize_policy_response(response: Any) -> dict[str, Any]:
             "log_prob": _finite_optional_float(response.get("log_prob")) if structured else None,
             "policy_version": response.get("policy_version") if structured else None,
             "decision_id": response.get("decision_id") if structured else None,
+            "action_probabilities": (
+                _action_probabilities(response.get("action_probabilities"))
+                if structured
+                else None
+            ),
         }
     )
     return result

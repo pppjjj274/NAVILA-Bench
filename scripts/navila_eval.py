@@ -11,6 +11,7 @@ import argparse
 import os
 import json
 import math
+import re
 import time
 import base64
 import io
@@ -22,6 +23,7 @@ from omni.isaac.lab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
+from safe_vln.replay import load_r2r_replay_episode
 
 # isaaclab argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -54,6 +56,20 @@ parser.add_argument("--progress-reward-scale", type=float, default=1.0)
 parser.add_argument("--success-reward", type=float, default=10.0)
 parser.add_argument("--macro-step-penalty", type=float, default=-0.01)
 parser.add_argument("--safe-dataset-dir", type=str, default=None)
+parser.add_argument(
+    "--safe-replay",
+    action="store_true",
+    help="Use offline R2R frames for NaViLA while retaining Go2 physics and safety.",
+)
+parser.add_argument("--safe-replay-root", type=str, default=None)
+parser.add_argument("--safe-replay-annotations", type=str, default=None)
+parser.add_argument("--safe-replay-id", type=int, default=None)
+parser.add_argument(
+    "--safe-policy-tag",
+    type=str,
+    default=None,
+    help="Filesystem-safe policy label added to Safe-Replay IDs and outputs.",
+)
 
 
 # r2r argparse arguments
@@ -64,11 +80,40 @@ cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.max_episode_seconds is not None and args_cli.max_episode_seconds <= 0:
+    parser.error("--max_episode_seconds must be positive")
+if args_cli.max_vlm_calls is not None and args_cli.max_vlm_calls <= 0:
+    parser.error("--max_vlm_calls must be positive")
 if args_cli.safe_blocked_seconds <= 0:
     parser.error("--safe-blocked-seconds must be positive")
 if args_cli.safe_blocked_distance <= 0:
     parser.error("--safe-blocked-distance must be positive")
+if args_cli.safe_policy_tag is not None:
+    if not args_cli.safe_vln:
+        parser.error("--safe-policy-tag requires --safe-vln")
+    if re.fullmatch(r"[A-Za-z0-9._-]+", args_cli.safe_policy_tag) is None:
+        parser.error(
+            "--safe-policy-tag may contain only letters, digits, '.', '_' and '-'"
+        )
+if args_cli.safe_replay:
+    if not args_cli.safe_vln:
+        parser.error("--safe-replay requires --safe-vln")
+    if args_cli.safe_replay_root is None:
+        parser.error("--safe-replay requires --safe-replay-root")
+    if args_cli.safe_replay_id is None:
+        parser.error("--safe-replay requires --safe-replay-id")
+    if getattr(args_cli, "enable_cameras", False):
+        parser.error("--safe-replay cannot be combined with --enable_cameras")
+    if not getattr(args_cli, "headless", False):
+        parser.error("--safe-replay requires --headless")
 
+replay_episode_preflight = None
+if args_cli.safe_replay:
+    replay_episode_preflight = load_r2r_replay_episode(
+        args_cli.safe_replay_root,
+        args_cli.safe_replay_id,
+        annotations_path=args_cli.safe_replay_annotations,
+    )
 
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
@@ -79,6 +124,7 @@ import imageio
 import numpy as np
 import torch
 from PIL import Image
+from PIL import ImageDraw
 
 from safe_vln.actions import normalize_policy_response
 from safe_vln.checkpoint import load_go2_inference_checkpoint
@@ -267,6 +313,252 @@ def _measurement_distance(infos):
     return float(infos["measurements"]["distance_to_goal"])
 
 
+def _recorded_policy_version(recorder):
+    versions = {
+        transition.get("policy_version")
+        for transition in recorder.transitions
+        if transition.get("policy_version") is not None
+    }
+    if len(versions) > 1:
+        raise RuntimeError(
+            f"episode contains multiple policy versions: {sorted(versions)}"
+        )
+    return next(iter(versions), None)
+
+
+def _replay_diagnostic_frame(frame, *, instruction, predicted, oracle, reward, cost, reason):
+    image = frame.convert("RGB").resize((512, 512))
+    canvas = Image.new("RGB", (1024, 512), "white")
+    canvas.paste(image, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    lines = [
+        "SAFE-REPLAY (offline visual / unpaired physics)",
+        f"Instruction: {instruction}",
+        f"Predicted: {predicted}",
+        f"Oracle: {oracle}",
+        f"Reward: {reward:.1f}    Cost: {cost:.1f}",
+        f"Termination: {reason or '-'}",
+    ]
+    y = 20
+    for line in lines:
+        words = line.split()
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if draw.textlength(candidate) > 475 and current:
+                draw.text((532, y), current, fill="black")
+                y += 24
+                current = word
+            else:
+                current = candidate
+        draw.text((532, y), current, fill="black")
+        y += 30
+    return np.asarray(canvas)
+
+
+def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
+    """Run offline R2R observations against live Go2 physics and safety."""
+    replay_run_id = (
+        f"replay{replay_episode.episode_id}_physical"
+        f"{physical_episode['episode_id']}"
+    )
+    if args_cli.safe_policy_tag:
+        replay_run_id = f"{replay_run_id}_{args_cli.safe_policy_tag}"
+    recorder = SafeTrajectoryRecorder(
+        episode_id=replay_run_id,
+        scene_id=physical_episode["scene_id"],
+        instruction=replay_episode.instruction,
+        gamma=args_cli.safe_gamma,
+        cost_limit=args_cli.safe_cost_limit,
+    )
+    dataset_writer = (
+        SafeVLNShardWriter(args_cli.safe_dataset_dir)
+        if args_cli.safe_dataset_dir
+        else None
+    )
+    dataset_samples = []
+    diagnostic_frames = []
+
+    step_dt = env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation
+    max_steps = round(100 * 0.5 / step_dt)
+    if args_cli.max_episode_seconds is not None:
+        max_steps = min(max_steps, round(args_cli.max_episode_seconds / step_dt))
+
+    num_steps = 0
+    vlm_calls = 0
+    terminal = False
+    termination_reason = None
+    try:
+        for replay_index, replay_step in enumerate(replay_episode.steps):
+            if terminal or not simulation_app.is_running() or num_steps >= max_steps:
+                break
+            if args_cli.max_vlm_calls is not None and vlm_calls >= args_cli.max_vlm_calls:
+                termination_reason = "max_vlm_calls"
+                break
+
+            sampled_frames = replay_step.load_frames()
+            response = sample_images_and_send_to_vlm(
+                sampled_frames,
+                args_cli.vlm_host,
+                args_cli.vlm_port,
+                replay_episode.instruction,
+                request_metadata={
+                    "protocol_version": "safe-vln-go2-v1",
+                    "mode": "act",
+                    "episode_id": replay_run_id,
+                    "replay_episode_id": str(replay_episode.episode_id),
+                    "replay_video_id": replay_step.video_id,
+                    "transition_index": len(recorder.transitions),
+                    "deterministic": True,
+                },
+            )
+            vlm_calls += 1
+            policy_output = normalize_policy_response(response)
+            oracle_action = replay_step.oracle_action
+            action_match = (
+                not policy_output["invalid_action"]
+                and policy_output["action_id"] == oracle_action.action_id
+            )
+            oracle_reward = float(action_match)
+            recorder.begin(policy_output, _measurement_distance(infos))
+            print(
+                f"Safe-Replay output: {response}\n"
+                f"Predicted {policy_output['action_id']}: {policy_output['text']}\n"
+                f"Oracle {oracle_action.action_id}: {oracle_action.text}\n"
+                f"Command: {policy_output['velocity_command']}, "
+                f"duration: {policy_output['duration']:.2f}s\n",
+                flush=True,
+            )
+
+            safety = infos.get("safety", {})
+            if policy_output["action_id"] == 9:
+                env.set_stop_called(True)
+                env.measure_manager.update_measures()
+                infos["measurements"] = env.measure_manager.get_measurements()
+                termination_reason = "policy_stop"
+                terminal = True
+            else:
+                requested_steps = max(1, round(policy_output["duration"] / step_dt))
+                command = torch.tensor(
+                    policy_output["velocity_command"], device=obs.device
+                )
+                for _ in range(requested_steps):
+                    obs, _, done, infos = env.step(command)
+                    recorder.count_env_step()
+                    num_steps += 1
+                    safety = infos.get("safety", {})
+                    if safety.get("cost", 0.0) > 0:
+                        termination_reason = safety["termination_reason"]
+                    elif done:
+                        termination_reason = "environment_termination"
+                    elif num_steps >= max_steps:
+                        termination_reason = "max_episode_steps"
+                    if termination_reason:
+                        terminal = True
+                        break
+
+            if (
+                not terminal
+                and replay_index == len(replay_episode.steps) - 1
+            ):
+                termination_reason = "replay_exhausted"
+                terminal = True
+
+            recorder.finish(
+                distance_after=_measurement_distance(infos),
+                reward_override=oracle_reward,
+                reward_components={"oracle_action_match": oracle_reward},
+                unsafe_contact=bool(safety.get("unsafe_contact", False)),
+                fall=bool(safety.get("fall", False)),
+                blocked=bool(safety.get("blocked", False)),
+                safety_diagnostics=safety,
+                terminated=terminal and termination_reason not in {
+                    "max_episode_steps",
+                    "max_vlm_calls",
+                    "replay_exhausted",
+                },
+                truncated=termination_reason in {
+                    "max_episode_steps",
+                    "max_vlm_calls",
+                    "replay_exhausted",
+                },
+                termination_reason=termination_reason,
+            )
+            transition = recorder.transitions[-1]
+            transition.update(
+                {
+                    "episode_id": replay_run_id,
+                    "physical_episode_id": str(physical_episode["episode_id"]),
+                    "scene_id": physical_episode["scene_id"],
+                    "instruction": replay_episode.instruction,
+                    "replay_episode_id": str(replay_episode.episode_id),
+                    "replay_video_id": replay_step.video_id,
+                    "oracle_action_id": oracle_action.action_id,
+                    "oracle_action_text": oracle_action.text,
+                    "raw_oracle_action": replay_step.raw_oracle_action,
+                    "action_match": action_match,
+                    "reward_source": "oracle_action_match",
+                    "observation_alignment": "offline_unpaired",
+                    "navigation_metrics_aligned": False,
+                    "policy_tag": args_cli.safe_policy_tag,
+                }
+            )
+            transition["observation_key"] = (
+                f"{replay_run_id}/state{transition['index']:06d}"
+            )
+            transition["next_observation_key"] = (
+                None
+                if transition["done"]
+                else (
+                    f"{replay_run_id}/state"
+                    f"{transition['index'] + 1:06d}"
+                )
+            )
+            diagnostic_frames.append(
+                _replay_diagnostic_frame(
+                    sampled_frames[-1],
+                    instruction=replay_episode.instruction,
+                    predicted=policy_output["text"],
+                    oracle=oracle_action.text,
+                    reward=transition["reward"],
+                    cost=transition["cost"],
+                    reason=termination_reason,
+                )
+            )
+            if dataset_writer is not None:
+                dataset_samples.append(
+                    (transition["observation_key"], sampled_frames, transition)
+                )
+    finally:
+        if (
+            recorder.transitions
+            and not recorder.transitions[-1].get("done")
+            and termination_reason == "max_vlm_calls"
+        ):
+            recorder.transitions[-1]["done"] = True
+            recorder.transitions[-1]["truncated"] = True
+            recorder.transitions[-1]["termination_reason"] = termination_reason
+        recorder.finalize()
+        if dataset_writer is not None:
+            for sample_key, frames, metadata in dataset_samples:
+                dataset_writer.add(sample_key, frames, metadata)
+            dataset_writer.close()
+            episode_data = recorder.to_dict(infos.get("measurements", {}))
+            episode_data.update(
+                {
+                    "replay_episode_id": str(replay_episode.episode_id),
+                    "physical_episode_id": str(physical_episode["episode_id"]),
+                    "observation_alignment": "offline_unpaired",
+                    "navigation_metrics_aligned": False,
+                    "reward_source": "oracle_action_match",
+                    "policy_tag": args_cli.safe_policy_tag,
+                    "policy_version": _recorded_policy_version(recorder),
+                }
+            )
+            write_episode_summary(args_cli.safe_dataset_dir, episode_data)
+    return infos, diagnostic_frames, recorder
+
+
 def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction, episode):
     recorder = SafeTrajectoryRecorder(
         episode_id=episode["episode_id"],
@@ -403,13 +695,26 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
     return infos, rgb_obses, recorder
 
 
-def save_evaluation_outputs(env, episode, measurements, rgb_obses, trajectory=None):
+def save_evaluation_outputs(
+    env,
+    episode,
+    measurements,
+    rgb_obses,
+    trajectory=None,
+    *,
+    output_stem=None,
+    video_fps=10,
+):
     result_dir = f"eval_results/{args_cli.task}_loco_{args_cli.load_run}"
     measurement_dir = os.path.join(result_dir, "measurements")
     video_dir = os.path.join(result_dir, "videos")
     os.makedirs(measurement_dir, exist_ok=True)
     os.makedirs(video_dir, exist_ok=True)
-    output_index = int(episode["episode_id"]) - 1
+    output_index = (
+        str(output_stem)
+        if output_stem is not None
+        else str(int(episode["episode_id"]) - 1)
+    )
     with open(f"{measurement_dir}/{output_index}.json", "w") as file:
         json.dump(measurements, file, indent=4)
     if trajectory is not None:
@@ -417,7 +722,9 @@ def save_evaluation_outputs(env, episode, measurements, rgb_obses, trajectory=No
         os.makedirs(trajectory_dir, exist_ok=True)
         with open(f"{trajectory_dir}/{output_index}.json", "w") as file:
             json.dump(trajectory, file, indent=2)
-    writer = imageio.get_writer(f"{video_dir}/output_{output_index}.mp4", fps=10)
+    writer = imageio.get_writer(
+        f"{video_dir}/output_{output_index}.mp4", fps=video_fps
+    )
     for frame in rgb_obses:
         writer.append_data(frame.astype(np.uint8))
     writer.close()
@@ -433,6 +740,14 @@ def main():
     r2r_data_path = os.path.join(ASSETS_DIR, "vln_ce_isaac_v1.json.gz")
     all_episodes = read_episodes(r2r_data_path)
     episode = all_episodes[args_cli.episode_idx]
+    replay_episode = replay_episode_preflight
+    if args_cli.safe_replay:
+        print(
+            f"[SAFE-REPLAY] loaded replay episode {replay_episode.episode_id} "
+            f"with {len(replay_episode.steps)} action points; "
+            f"physical Isaac episode={episode['episode_id']}",
+            flush=True,
+        )
 
     env_cfg = parse_env_cfg(args_cli.task, num_envs=args_cli.num_envs)
 
@@ -441,6 +756,16 @@ def main():
         # high-level wrapper must observe and record the terminal Go2 pose first.
         env_cfg.terminations.base_contact = None
         env_cfg.terminations.bad_orientation = None
+    if args_cli.safe_replay:
+        # Offline replay replaces every high-level RGB observation. Removing
+        # both sensors and their observation groups keeps Isaac camera/RTX
+        # extensions out of the runtime while preserving LiDAR locomotion.
+        env_cfg.scene.rgbd_camera = None
+        env_cfg.scene.viz_rgb_camera = None
+        env_cfg.observations.camera_obs = None
+        env_cfg.observations.viz_camera_obs = None
+        if hasattr(env_cfg.observations, "depth_obs"):
+            env_cfg.observations.depth_obs = None
 
     # reset the position and rotation of the robot
     env_cfg = reset_start_pos_rot(env_cfg, args_cli, episode)
@@ -482,24 +807,76 @@ def main():
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
     all_measures = ["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]
-    env = VLNEnvWrapper(env, policy, args_cli.task, episode, high_level_obs_key="camera_obs",
+    env = VLNEnvWrapper(
+                        env, policy, args_cli.task, episode,
+                        high_level_obs_key=None if args_cli.safe_replay else "camera_obs",
                         measure_names=all_measures, safe_vln=args_cli.safe_vln,
                         contact_threshold=args_cli.safe_contact_threshold,
                         orientation_limit=args_cli.safe_orientation_limit,
                         blocked_seconds=args_cli.safe_blocked_seconds,
                         blocked_distance=args_cli.safe_blocked_distance)
     
-    # set view pos and target
-    robot_pos_w = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
-    robot_quat_w = env.unwrapped.scene["robot"].data.root_quat_w[0].detach().cpu().numpy()
-    roll, pitch, yaw = quat2eulers(robot_quat_w[0], robot_quat_w[1], robot_quat_w[2], robot_quat_w[3])
-    cam_eye = (robot_pos_w[0] - 0.8 * math.sin(-yaw), robot_pos_w[1] - 0.8 * math.cos(-yaw), robot_pos_w[2] + 0.8)
-    cam_target = (robot_pos_w[0], robot_pos_w[1], robot_pos_w[2])
-    # set the camera view
-    env.unwrapped.sim.set_camera_view(eye=cam_eye, target=cam_target)
+    if not args_cli.safe_replay:
+        # set view pos and target
+        robot_pos_w = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
+        robot_quat_w = env.unwrapped.scene["robot"].data.root_quat_w[0].detach().cpu().numpy()
+        roll, pitch, yaw = quat2eulers(robot_quat_w[0], robot_quat_w[1], robot_quat_w[2], robot_quat_w[3])
+        cam_eye = (robot_pos_w[0] - 0.8 * math.sin(-yaw), robot_pos_w[1] - 0.8 * math.cos(-yaw), robot_pos_w[2] + 0.8)
+        cam_target = (robot_pos_w[0], robot_pos_w[1], robot_pos_w[2])
+        # set the camera view
+        env.unwrapped.sim.set_camera_view(eye=cam_eye, target=cam_target)
     
     # step with zeros actions to get the initial frame
     obs, infos = env.reset()
+
+    if args_cli.safe_replay:
+        infos, rgb_obses, recorder = run_safe_replay_episode(
+            env, obs, infos, replay_episode, episode
+        )
+        measurements = dict(infos["measurements"])
+        measurements.update(recorder.summary(measurements))
+        measurements.update(
+            {
+                "replay_episode_id": str(replay_episode.episode_id),
+                "physical_episode_id": str(episode["episode_id"]),
+                "observation_alignment": "offline_unpaired",
+                "navigation_metrics_aligned": False,
+                "reward_source": "oracle_action_match",
+                "policy_tag": args_cli.safe_policy_tag,
+                "policy_version": _recorded_policy_version(recorder),
+            }
+        )
+        trajectory = recorder.to_dict(measurements)
+        trajectory.update(
+            {
+                "replay_episode_id": str(replay_episode.episode_id),
+                "physical_episode_id": str(episode["episode_id"]),
+                "observation_alignment": "offline_unpaired",
+                "navigation_metrics_aligned": False,
+                "reward_source": "oracle_action_match",
+                "policy_tag": args_cli.safe_policy_tag,
+                "policy_version": _recorded_policy_version(recorder),
+            }
+        )
+        replay_output_stem = (
+            f"replay_{replay_episode.episode_id}_physical_"
+            f"{episode['episode_id']}"
+        )
+        if args_cli.safe_policy_tag:
+            replay_output_stem = (
+                f"{replay_output_stem}_{args_cli.safe_policy_tag}"
+            )
+        save_evaluation_outputs(
+            env,
+            episode,
+            measurements,
+            rgb_obses,
+            trajectory,
+            output_stem=replay_output_stem,
+            video_fps=2,
+        )
+        env.close()
+        return
 
     # NaViLA training gets image observations each 0.5s, visualize every 0.1s
     steps_per_image = 0.5 / (env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation)

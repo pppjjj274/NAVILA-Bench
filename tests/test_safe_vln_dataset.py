@@ -20,3 +20,5 @@ def test_atomic_shard_round_trip(tmp_path):
     assert loaded_metadata == metadata
     manifest = json.loads((tmp_path / "manifest.json").read_text())
     assert manifest["schema_version"] == "safe-vln-go2-v1"
+    assert manifest["samples_written_this_run"] == 1
+    assert manifest["total_samples"] == 1

@@ -4,7 +4,12 @@ import numpy as np
 import pytest
 import torch
 
-from safe_vln.actions import ACTIONS, action_from_text, normalize_policy_response
+from safe_vln.actions import (
+    ACTIONS,
+    NAVILA_ACTION_RESPONSES,
+    action_from_text,
+    normalize_policy_response,
+)
 from safe_vln.cmdp import LagrangeController, compute_gae, compute_returns, safe_advantage
 from safe_vln.trainer import constrained_ppo_loss
 from safe_vln.trajectory import SafeTrajectoryRecorder
@@ -12,6 +17,8 @@ from safe_vln.trajectory import SafeTrajectoryRecorder
 
 def test_canonical_action_space_and_legacy_parser():
     assert len(ACTIONS) == 10
+    assert len(NAVILA_ACTION_RESPONSES) == len(ACTIONS)
+    assert NAVILA_ACTION_RESPONSES[-1].startswith("I think I should stop")
     assert ACTIONS[7].velocity_command == (0.5, 0.0, 0.0)
     assert ACTIONS[7].duration == 1.0
     assert action_from_text("turn right 45 degrees")[0].action_id == 5
@@ -25,6 +32,20 @@ def test_structured_response_uses_local_command_and_rejects_bad_values():
     assert result["velocity_command"] == [0.5, 0.0, 0.0]
     assert result["reward_value"] is None
     assert result["cost_value"] == 0.2
+
+
+def test_structured_response_records_normalized_action_probabilities():
+    probabilities = [1.0] * len(ACTIONS)
+    result = normalize_policy_response(
+        {"action_id": 6, "action_probabilities": probabilities}
+    )
+
+    assert result["action_probabilities"] == pytest.approx(
+        [1.0 / len(ACTIONS)] * len(ACTIONS)
+    )
+    assert normalize_policy_response(
+        {"action_id": 6, "action_probabilities": [1.0, float("nan")]}
+    )["action_probabilities"] is None
 
 
 def test_reward_cost_returns_and_lagrange_direction():
@@ -79,6 +100,28 @@ def test_trajectory_records_blocked_as_terminal_cost():
     assert recorder.transitions[0]["cost_return"] == 1.0
     assert recorder.summary()["blocked_count"] == 1.0
     assert recorder.summary()["has_blocked"] is True
+
+
+def test_trajectory_accepts_oracle_reward_override_and_keeps_physical_progress():
+    recorder = SafeTrajectoryRecorder(
+        episode_id="1",
+        scene_id="scene",
+        instruction="go",
+    )
+    recorder.begin(normalize_policy_response({"action_id": 7}), 5.0)
+    item = recorder.finish(
+        distance_after=4.0,
+        reward_override=0.0,
+        reward_components={"oracle_action_match": 0.0},
+        terminated=True,
+        termination_reason="replay_exhausted",
+    )
+    recorder.finalize()
+
+    assert item["reward"] == 0.0
+    assert item["physical_progress"] == pytest.approx(1.0)
+    assert item["reward_components"] == {"oracle_action_match": 0.0}
+    assert recorder.transitions[0]["reward_return"] == 0.0
 
 
 def test_constrained_ppo_loss_is_finite_and_backpropagates():

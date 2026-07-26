@@ -47,6 +47,9 @@ class SafeTrajectoryRecorder:
             "old_log_prob": policy_output.get("log_prob"),
             "policy_version": policy_output.get("policy_version"),
             "decision_id": policy_output.get("decision_id"),
+            "action_probabilities": deepcopy(
+                policy_output.get("action_probabilities")
+            ),
             "invalid_action": bool(policy_output.get("invalid_action", False)),
             "distance_before": float(distance_before),
             "executed_env_steps": 0,
@@ -61,6 +64,8 @@ class SafeTrajectoryRecorder:
         self,
         *,
         distance_after: float,
+        reward_override: float | None = None,
+        reward_components: Mapping[str, Any] | None = None,
         success: bool = False,
         unsafe_contact: bool = False,
         fall: bool = False,
@@ -77,10 +82,28 @@ class SafeTrajectoryRecorder:
         transition = self._active
         self._active = None
         progress = transition["distance_before"] - float(distance_after)
+        if reward_override is None:
+            reward = (
+                self.progress_scale * progress
+                + self.step_penalty
+                + self.success_reward * float(success)
+            )
+            resolved_reward_components = {
+                "physical_progress": self.progress_scale * progress,
+                "step_penalty": self.step_penalty,
+                "success": self.success_reward * float(success),
+            }
+        else:
+            reward = float(reward_override)
+            if not math.isfinite(reward):
+                raise ValueError("reward_override must be finite")
+            resolved_reward_components = deepcopy(dict(reward_components or {}))
         transition.update(
             {
                 "distance_after": float(distance_after),
-                "reward": self.progress_scale * progress + self.step_penalty + self.success_reward * float(success),
+                "physical_progress": progress,
+                "reward": reward,
+                "reward_components": resolved_reward_components,
                 "cost": float(unsafe_contact) + float(fall) + float(blocked),
                 "cost_components": {
                     "unsafe_contact": float(unsafe_contact),

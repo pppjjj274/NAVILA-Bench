@@ -9,6 +9,8 @@ import torch
 
 
 def normalize_advantage(value: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
+    if value.numel() <= 1:
+        return value
     return (value - value.mean()) / (value.std(unbiased=False) + epsilon)
 
 
@@ -28,9 +30,11 @@ def constrained_ppo_loss(
     reward_value_coef: float = 0.5,
     cost_value_coef: float = 0.5,
     entropy_coef: float = 0.01,
+    normalize_advantages: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    reward_advantages = normalize_advantage(reward_advantages)
-    cost_advantages = normalize_advantage(cost_advantages)
+    if normalize_advantages:
+        reward_advantages = normalize_advantage(reward_advantages)
+        cost_advantages = normalize_advantage(cost_advantages)
     safe_advantages = (reward_advantages - lagrange_multiplier * cost_advantages) / (1.0 + lagrange_multiplier)
     ratio = torch.exp(new_log_probs - old_log_probs)
     clipped_ratio = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio)
@@ -62,6 +66,7 @@ class PPOConfig:
     ppo_epochs: int = 4
     mini_batch_size: int = 16
     max_grad_norm: float = 0.5
+    normalize_advantages: bool = True
 
 
 class SafePPOOptimizer:
@@ -82,12 +87,32 @@ class SafePPOOptimizer:
             **batch,
             lagrange_multiplier=lagrange_multiplier,
             clip_ratio=self.config.clip_ratio,
+            normalize_advantages=self.config.normalize_advantages,
         )
         if not torch.isfinite(loss):
             raise FloatingPointError("Safe-VLN PPO loss is not finite")
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         parameters = [parameter for group in self.optimizer.param_groups for parameter in group["params"]]
-        torch.nn.utils.clip_grad_norm_(parameters, self.config.max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            parameters, self.config.max_grad_norm
+        )
+        if not torch.isfinite(grad_norm):
+            self.optimizer.zero_grad(set_to_none=True)
+            raise FloatingPointError(
+                "Safe-VLN PPO gradient norm is not finite; "
+                "use BF16 training or lower the learning rate"
+            )
+        stats["optimizer/grad_norm"] = float(grad_norm.detach().item())
         self.optimizer.step()
+        if any(
+            not torch.isfinite(parameter).all()
+            for parameter in parameters
+            if parameter.requires_grad
+        ):
+            self.optimizer.zero_grad(set_to_none=True)
+            raise FloatingPointError(
+                "Safe-VLN PPO produced non-finite trainable parameters"
+            )
+        self.optimizer.zero_grad(set_to_none=True)
         return stats

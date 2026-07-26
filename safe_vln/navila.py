@@ -56,6 +56,7 @@ def load_safe_navila(
     model_path: str,
     *,
     device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
     add_lora: bool = True,
     checkpoint: str | None = None,
 ):
@@ -73,8 +74,18 @@ def load_safe_navila(
         base_model = PeftModel.from_pretrained(base_model, checkpoint, is_trainable=add_lora)
     elif add_lora:
         base_model = add_lora_adapters(base_model)
+    # The external NaViLA loader creates FP16 modules.  FP16 LoRA gradients
+    # overflowed on A800 after the first PPO update; BF16 preserves the same
+    # memory footprint while providing the exponent range needed for training.
+    base_model = base_model.to(device=device, dtype=dtype)
     safe_model = SafeNavilaActorCritic(base_model, tokenizer).to(device)
     if checkpoint:
         safe_model.load_safe_heads(checkpoint, map_location=device)
-    preprocessor = NavilaStatePreprocessor(tokenizer, image_processor, base_model.config, device=device)
+    preprocessor = NavilaStatePreprocessor(
+        tokenizer,
+        image_processor,
+        base_model.config,
+        device=device,
+        dtype=dtype,
+    )
     return safe_model, preprocessor

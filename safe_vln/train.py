@@ -11,7 +11,18 @@ from .cmdp import LagrangeController, compute_gae
 from .dataset import iter_samples
 from .learner import evaluate_selected_actions, save_checkpoint, train_critic_epoch
 from .navila import load_safe_navila
-from .trainer import PPOConfig, SafePPOOptimizer
+from .trainer import PPOConfig, SafePPOOptimizer, normalize_advantage
+
+
+def _training_dtype(args):
+    name = getattr(args, "training_dtype", "bfloat16")
+    if name == "bfloat16":
+        if str(args.device).startswith("cuda") and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("the selected CUDA device does not support bfloat16")
+        return torch.bfloat16
+    if name == "float16":
+        return torch.float16
+    raise ValueError(f"unsupported training dtype: {name}")
 
 
 def _optimizer(model, actor_lr, critic_lr):
@@ -28,6 +39,7 @@ def warmup(args):
     model, preprocessor = load_safe_navila(
         args.model_path,
         device=args.device,
+        dtype=_training_dtype(args),
         checkpoint=args.checkpoint,
     )
     model.base_model.requires_grad_(False)
@@ -35,7 +47,10 @@ def warmup(args):
         list(model.reward_head.parameters()) + list(model.cost_head.parameters()),
         lr=args.critic_lr,
     )
-    state = {"mode": "warmup-critics"}
+    state = {
+        "mode": "warmup-critics",
+        "training_dtype": getattr(args, "training_dtype", "bfloat16"),
+    }
     for epoch in range(args.epochs):
         stats = train_critic_epoch(
             model,
@@ -104,14 +119,65 @@ def _load_on_policy_samples(args):
     return samples, episode_costs
 
 
+def _normalize_rollout_advantages(samples):
+    for key in ("reward_advantage", "cost_advantage"):
+        values = torch.tensor(
+            [sample[1][key] for sample in samples], dtype=torch.float32
+        )
+        normalized = normalize_advantage(values)
+        for sample, value in zip(samples, normalized.tolist()):
+            sample[1][f"normalized_{key}"] = value
+
+
+def _validate_rollout_policy_version(samples, expected_version):
+    versions = {
+        sample[1].get("policy_version")
+        for sample in samples
+        if sample[1].get("policy_version") is not None
+    }
+    has_unversioned = any(
+        sample[1].get("policy_version") is None for sample in samples
+    )
+    if has_unversioned:
+        if versions:
+            raise RuntimeError(
+                "rollout dataset mixes versioned and unversioned policies"
+            )
+        if expected_version != 0:
+            raise RuntimeError(
+                "unversioned rollout data is accepted only for policy version 0"
+            )
+        return
+    if versions != {expected_version}:
+        raise RuntimeError(
+            f"rollout policy versions {sorted(versions)} do not match "
+            f"--policy-version={expected_version}"
+        )
+
+
 def train(args):
     if not args.checkpoint:
         raise ValueError("constrained PPO requires a warmup --checkpoint")
     model, preprocessor = load_safe_navila(
         args.model_path,
         device=args.device,
+        dtype=_training_dtype(args),
         checkpoint=args.checkpoint,
     )
+    model.train()
+    if hasattr(model.base_model, "gradient_checkpointing_enable"):
+        try:
+            model.base_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.base_model.gradient_checkpointing_enable()
+    navila_model = model._navila_model()
+    if navila_model is not None and hasattr(navila_model.llm, "model"):
+        if not navila_model.llm.model.training:
+            raise RuntimeError("NaViLA Llama backbone must be in training mode")
+        if not getattr(navila_model.llm.model, "gradient_checkpointing", False):
+            raise RuntimeError("NaViLA Llama gradient checkpointing was not enabled")
     optimizer = _optimizer(model, args.actor_lr, args.critic_lr)
     ppo = SafePPOOptimizer(
         optimizer,
@@ -119,9 +185,12 @@ def train(args):
             clip_ratio=args.clip_ratio,
             ppo_epochs=args.ppo_epochs,
             mini_batch_size=args.mini_batch_size,
+            normalize_advantages=False,
         ),
     )
     samples, episode_costs = _load_on_policy_samples(args)
+    _validate_rollout_policy_version(samples, args.policy_version)
+    _normalize_rollout_advantages(samples)
     mean_cost = sum(episode_costs.values()) / len(episode_costs)
     lagrange = LagrangeController(
         cost_limit=args.cost_limit,
@@ -134,6 +203,8 @@ def train(args):
     for epoch in range(args.ppo_epochs):
         for start in range(0, len(samples), args.mini_batch_size):
             mini_batch = samples[start : start + args.mini_batch_size]
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
             states = [
                 preprocessor(frames, metadata["instruction"])
                 for frames, metadata in mini_batch
@@ -155,12 +226,16 @@ def train(args):
             batch = {
                 **evaluated,
                 "old_log_probs": tensor("old_log_prob"),
-                "reward_advantages": tensor("reward_advantage"),
-                "cost_advantages": tensor("cost_advantage"),
+                "reward_advantages": tensor("normalized_reward_advantage"),
+                "cost_advantages": tensor("normalized_cost_advantage"),
                 "reward_returns": tensor("ppo_reward_return"),
                 "cost_returns": tensor("ppo_cost_return"),
             }
             stats = ppo.step(batch, lagrange.multiplier)
+            if torch.cuda.is_available():
+                stats["memory/peak_allocated_gib"] = (
+                    torch.cuda.max_memory_allocated() / (1024 ** 3)
+                )
             update += 1
             print(
                 json.dumps(
@@ -173,6 +248,9 @@ def train(args):
                 ),
                 flush=True,
             )
+            del states, evaluated, batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     state = {
         "mode": "constrained-ppo",
@@ -183,6 +261,7 @@ def train(args):
         "cost_limit": args.cost_limit,
         "gamma": args.gamma,
         "gae_lambda": args.gae_lambda,
+        "training_dtype": getattr(args, "training_dtype", "bfloat16"),
     }
     save_checkpoint(model, optimizer, args.output_dir, state)
     return 0

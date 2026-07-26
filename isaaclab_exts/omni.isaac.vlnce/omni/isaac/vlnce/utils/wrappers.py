@@ -137,7 +137,7 @@ class VLNEnvWrapper:
 
     def __init__(self, env: ManagerBasedRLEnv,
                  low_level_policy, task_name,
-                 episode, max_length=10000, high_level_obs_key="camera_obs",
+                 episode, max_length=10000, high_level_obs_key: str | None = "camera_obs",
                  safe_vln=False, contact_threshold=1.0, orientation_limit=0.8,
                  blocked_seconds=2.0, blocked_distance=0.1,
                  measure_names=["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]
@@ -166,7 +166,8 @@ class VLNEnvWrapper:
         self.max_length = max_length
 
         self.high_level_obs_key = high_level_obs_key
-        assert high_level_obs_key in self.env.observation_space.spaces.keys() # CHECK this
+        if high_level_obs_key is not None:
+            assert high_level_obs_key in self.env.observation_space.spaces.keys() # CHECK this
 
         self.low_level_policy = low_level_policy
         self.low_level_action = None
@@ -283,7 +284,11 @@ class VLNEnvWrapper:
 
         self.prev_pos = self.env.unwrapped.scene["robot"].data.root_pos_w[0].detach().clone()
 
-        obs = infos["observations"][self.high_level_obs_key]
+        obs = (
+            low_level_obs
+            if self.high_level_obs_key is None
+            else infos["observations"][self.high_level_obs_key]
+        )
         return obs, infos
 
     def update_command(self, command) -> None:
@@ -321,7 +326,11 @@ class VLNEnvWrapper:
 
         low_level_obs, reward, done, info = self.env.step(low_level_action)
         self.low_level_obs = low_level_obs
-        obs = info["observations"][self.high_level_obs_key]
+        obs = (
+            low_level_obs
+            if self.high_level_obs_key is None
+            else info["observations"][self.high_level_obs_key]
+        )
         self.env_step += 1
 
         current_pos = self.unwrapped.scene["robot"].data.root_pos_w[0].detach()
@@ -384,5 +393,4 @@ class VLNEnvWrapper:
 
     def close(self) -> None:
         self.env.close()
-
 
