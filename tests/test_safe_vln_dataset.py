@@ -2,8 +2,10 @@ import json
 import tarfile
 
 from PIL import Image
+import pytest
 
 from safe_vln.dataset import SafeVLNShardWriter, iter_samples
+from safe_vln.objective import build_objective_config, default_cost_profile
 
 
 def test_atomic_shard_round_trip(tmp_path):
@@ -22,3 +24,12 @@ def test_atomic_shard_round_trip(tmp_path):
     assert manifest["schema_version"] == "safe-vln-go2-v1"
     assert manifest["samples_written_this_run"] == 1
     assert manifest["total_samples"] == 1
+
+
+def test_writer_rejects_appending_a_different_objective(tmp_path):
+    objective = build_objective_config(default_cost_profile())
+    SafeVLNShardWriter(tmp_path, objective_config=objective).close()
+    changed = dict(objective)
+    changed["fingerprint"] = "different"
+    with pytest.raises(ValueError, match="objective fingerprint"):
+        SafeVLNShardWriter(tmp_path, objective_config=changed)

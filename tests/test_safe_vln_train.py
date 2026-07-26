@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from safe_vln import train
+from safe_vln.objective import build_objective_config, default_cost_profile
 
 
 def _transition(episode_id, index, reward, cost, done):
@@ -67,3 +68,58 @@ def test_rollout_policy_version_validation():
     train._validate_rollout_policy_version(unversioned, 0)
     with pytest.raises(RuntimeError, match="only for policy version 0"):
         train._validate_rollout_policy_version(unversioned, 1)
+
+
+def test_v2_objective_contract_requires_matching_checkpoint_and_samples():
+    objective = build_objective_config(default_cost_profile())
+    manifest = {
+        "schema_version": "safe-vln-go2-v2",
+        "objective_fingerprint": objective["fingerprint"],
+        "objective_config": objective,
+    }
+    assert train._validate_objective_compatibility(
+        manifest, {"objective_fingerprint": objective["fingerprint"]}
+    ) == ("safe-vln-go2-v2", objective["fingerprint"])
+    with pytest.raises(RuntimeError, match="do not match"):
+        train._validate_objective_compatibility(
+            manifest, {"objective_fingerprint": "other"}
+        )
+
+    samples = [
+        (
+            None,
+            {
+                "schema_version": "safe-vln-go2-v2",
+                "objective_fingerprint": objective["fingerprint"],
+                "policy_objective_fingerprint": objective["fingerprint"],
+            },
+        )
+    ]
+    train._validate_sample_objective(samples, manifest)
+    samples[0][1]["objective_fingerprint"] = "other"
+    with pytest.raises(RuntimeError, match="manifest"):
+        train._validate_sample_objective(samples, manifest)
+
+
+def test_legacy_v1_samples_may_omit_schema_but_cannot_mix_v2_metadata():
+    manifest = {
+        "schema_version": "safe-vln-go2-v1",
+        "objective_fingerprint": None,
+    }
+    train._validate_sample_objective(
+        [(None, {"schema_version": None, "objective_fingerprint": None})],
+        manifest,
+    )
+    with pytest.raises(RuntimeError, match="do not match"):
+        train._validate_sample_objective(
+            [
+                (
+                    None,
+                    {
+                        "schema_version": "safe-vln-go2-v2",
+                        "objective_fingerprint": "v2",
+                    },
+                )
+            ],
+            manifest,
+        )

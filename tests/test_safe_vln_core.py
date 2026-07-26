@@ -46,6 +46,9 @@ def test_structured_response_records_normalized_action_probabilities():
     assert normalize_policy_response(
         {"action_id": 6, "action_probabilities": [1.0, float("nan")]}
     )["action_probabilities"] is None
+    assert normalize_policy_response(
+        {"action_id": 6, "objective_fingerprint": "objective"}
+    )["objective_fingerprint"] == "objective"
 
 
 def test_reward_cost_returns_and_lagrange_direction():

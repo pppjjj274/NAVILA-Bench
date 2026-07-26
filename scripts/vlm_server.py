@@ -54,6 +54,7 @@ class VLMServer:
         self.vision_tower = None
         self.safe_model = None
         self.safe_policy_version = None
+        self.safe_objective_fingerprint = None
         # 中文注释: 立即执行模型加载和初始化，让服务开始监听前就准备好推理所需资源。
         self.setup()
         if getattr(args, "safe_checkpoint", None):
@@ -77,6 +78,9 @@ class VLMServer:
                 trainer_state = json.load(state_file)
             self.safe_policy_version = int(
                 trainer_state.get("policy_version", 0)
+            )
+            self.safe_objective_fingerprint = trainer_state.get(
+                "objective_fingerprint"
             )
         else:
             self.safe_policy_version = 0
@@ -312,9 +316,10 @@ class VLMServer:
                 )
             action = action_from_id(safe_output["action_id"])
             return {
-                "protocol_version": "safe-vln-go2-v1",
+                "protocol_version": "safe-vln-go2-v2",
                 **safe_output,
                 "policy_version": self.safe_policy_version,
+                "objective_fingerprint": self.safe_objective_fingerprint,
                 "action": action.text,
             }
 

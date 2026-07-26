@@ -10,6 +10,8 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from PIL import Image
 
+from .objective import SCHEMA_VERSION, validate_objective_config
+
 
 class SafeVLNShardWriter:
     def __init__(
@@ -19,6 +21,8 @@ class SafeVLNShardWriter:
         split: str = "train",
         samples_per_shard: int = 256,
         jpeg_quality: int = 90,
+        schema_version: str | None = None,
+        objective_config: Mapping[str, Any] | None = None,
     ) -> None:
         if samples_per_shard <= 0:
             raise ValueError("samples_per_shard must be positive")
@@ -27,6 +31,29 @@ class SafeVLNShardWriter:
         self.split = split
         self.samples_per_shard = samples_per_shard
         self.jpeg_quality = jpeg_quality
+        self.objective_config = (
+            validate_objective_config(objective_config)
+            if objective_config
+            else {}
+        )
+        self.schema_version = str(
+            schema_version
+            or (SCHEMA_VERSION if self.objective_config else "safe-vln-go2-v1")
+        )
+        self.objective_fingerprint = self.objective_config.get("fingerprint")
+        if self.schema_version == SCHEMA_VERSION and not self.objective_fingerprint:
+            raise ValueError("v2 Safe-VLN shards require an objective fingerprint")
+        manifest_path = self.output_dir / "manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("schema_version") != self.schema_version:
+                raise ValueError(
+                    "cannot append Safe-VLN data with a different schema version"
+                )
+            if manifest.get("objective_fingerprint") != self.objective_fingerprint:
+                raise ValueError(
+                    "cannot append Safe-VLN data with a different objective fingerprint"
+                )
         self.shard_index = self._next_shard_index()
         self.sample_count = 0
         self.total_samples = 0
@@ -100,7 +127,9 @@ class SafeVLNShardWriter:
         manifest_path.write_text(
             json.dumps(
                 {
-                    "schema_version": "safe-vln-go2-v1",
+                    "schema_version": self.schema_version,
+                    "objective_fingerprint": self.objective_fingerprint,
+                    "objective_config": self.objective_config or None,
                     "split": self.split,
                     "completed_shards": len(completed_shards),
                     "samples_written_this_run": self.total_samples,

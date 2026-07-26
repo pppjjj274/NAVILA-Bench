@@ -16,6 +16,10 @@ The following example shows how to wrap an environment for RSL-RL:
 """
 
 
+from copy import deepcopy
+import json
+from pathlib import Path
+
 import gymnasium as gym
 import torch
 import numpy as np
@@ -23,9 +27,16 @@ import numpy as np
 from rsl_rl.env import VecEnv
 from safe_vln.safety import (
     BlockedDetector,
+    blocked_progress_risk,
+    combined_step_risk,
+    front_obstacle_distance,
+    inverse_distance_risk,
+    linear_risk,
     orientation_angle as compute_orientation_angle,
+    smoothness_risk,
     unsafe_contact_diagnostics,
 )
+from safe_vln.objective import default_cost_profile, validate_cost_profile
 
 from omni.isaac.lab.envs import DirectRLEnv, ManagerBasedRLEnv
 from omni.isaac.lab_tasks.utils.wrappers.rsl_rl import RslRlVecEnvWrapper
@@ -140,6 +151,7 @@ class VLNEnvWrapper:
                  episode, max_length=10000, high_level_obs_key: str | None = "camera_obs",
                  safe_vln=False, contact_threshold=1.0, orientation_limit=0.8,
                  blocked_seconds=2.0, blocked_distance=0.1,
+                 cost_profile=None, calibration_file=None,
                  measure_names=["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]
         ):
         self.env = env
@@ -149,17 +161,40 @@ class VLNEnvWrapper:
         if safe_vln and task_name != "go2_matterport_vision":
             raise ValueError("Safe-VLN currently supports only go2_matterport_vision")
         self.safe_vln = safe_vln
-        self.contact_threshold = float(contact_threshold)
-        self.orientation_limit = float(orientation_limit)
-        self.blocked_seconds = float(blocked_seconds)
+        if cost_profile is None:
+            profile = deepcopy(default_cost_profile())
+            profile.pop("fingerprint", None)
+            profile["hard_thresholds"].update(
+                {
+                    "contact_force_n": float(contact_threshold),
+                    "orientation_rad": float(orientation_limit),
+                    "blocked_seconds": float(blocked_seconds),
+                    "blocked_distance_m": float(blocked_distance),
+                }
+            )
+            self.cost_profile = validate_cost_profile(profile)
+        else:
+            self.cost_profile = validate_cost_profile(cost_profile)
+        hard = self.cost_profile["hard_thresholds"]
+        self.contact_threshold = float(hard["contact_force_n"])
+        self.orientation_limit = float(hard["orientation_rad"])
+        self.blocked_seconds = float(hard["blocked_seconds"])
         if self.blocked_seconds <= 0:
             raise ValueError("blocked_seconds must be positive")
         step_dt = float(self.unwrapped.cfg.sim.dt * self.unwrapped.cfg.decimation)
         self.blocked_window_steps = max(1, round(self.blocked_seconds / step_dt))
         self.blocked_detector = BlockedDetector(
             window_steps=self.blocked_window_steps,
-            min_displacement=float(blocked_distance),
+            min_displacement=float(hard["blocked_distance_m"]),
+            forward_threshold=float(hard["forward_command_mps"]),
         )
+        self._previous_macro_command = None
+        self._active_smoothness_risk = 0.0
+        self._calibration_file = None
+        if calibration_file:
+            calibration_path = Path(calibration_file).expanduser()
+            calibration_path.parent.mkdir(parents=True, exist_ok=True)
+            self._calibration_file = calibration_path.open("a", encoding="utf-8")
         self.last_safety = self._empty_safety()
 
         self.env_step = 0
@@ -182,6 +217,17 @@ class VLNEnvWrapper:
             "fall": False,
             "blocked": False,
             "cost": 0.0,
+            "hard_cost": 0.0,
+            "dense_risk": 0.0,
+            "hard_violation": False,
+            "risk_components": {
+                "contact": 0.0,
+                "tilt": 0.0,
+                "near_obstacle": 0.0,
+                "blocked": 0.0,
+                "speed_near": 0.0,
+                "smoothness": 0.0,
+            },
             "termination_reason": None,
             "contact_bodies": [],
             "contact_body_forces": {},
@@ -189,6 +235,8 @@ class VLNEnvWrapper:
             "orientation_angle": 0.0,
             "blocked_steps": 0,
             "blocked_displacement": 0.0,
+            "front_obstacle_distance_m": None,
+            "planar_speed_mps": 0.0,
         }
 
     def _compute_go2_safety(self, action, previous_position, current_position):
@@ -217,6 +265,64 @@ class VLNEnvWrapper:
                 action, previous_position, current_position
             )
         blocked = bool(blocked_status and blocked_status.blocked)
+        soft = self.cost_profile["soft_thresholds"]
+        ray_sector = self.cost_profile["ray_sector"]
+        try:
+            lidar = self.unwrapped.scene.sensors["lidar_sensor"]
+        except KeyError as exc:
+            raise RuntimeError(
+                "Safe-VLN v2 requires the Go2 lidar_sensor even when cameras are disabled"
+            ) from exc
+        robot = self.unwrapped.scene["robot"]
+        obstacle_distance = front_obstacle_distance(
+            lidar.data.pos_w[0],
+            lidar.data.ray_hits_w[0],
+            robot.data.root_quat_w[0],
+            horizontal_half_angle_deg=ray_sector["horizontal_half_angle_deg"],
+            vertical_half_angle_deg=ray_sector["vertical_half_angle_deg"],
+        )
+        planar_speed = float(
+            torch.linalg.vector_norm(robot.data.root_lin_vel_b[0, :2]).item()
+        )
+        near_risk = (
+            0.0
+            if obstacle_distance is None
+            else inverse_distance_risk(
+                obstacle_distance,
+                soft["near_critical_m"],
+                soft["near_safe_m"],
+            )
+        )
+        blocked_risk = (
+            0.0
+            if blocked_status is None
+            else blocked_progress_risk(
+                blocked_status,
+                window_steps=self.blocked_window_steps,
+                min_displacement=float(
+                    self.cost_profile["hard_thresholds"]["blocked_distance_m"]
+                ),
+            )
+        )
+        risk_components = {
+            "contact": linear_risk(
+                max_contact_force,
+                soft["contact_force_n"],
+                self.contact_threshold,
+            ),
+            "tilt": linear_risk(
+                orientation, soft["orientation_rad"], self.orientation_limit
+            ),
+            "near_obstacle": near_risk,
+            "blocked": blocked_risk,
+            "speed_near": near_risk
+            * min(1.0, planar_speed / soft["planar_speed_scale_mps"]),
+            "smoothness": self._active_smoothness_risk,
+        }
+        dense_risk = combined_step_risk(
+            risk_components, self.cost_profile["risk_weights"]
+        )
+        hard_violation = unsafe_contact or fall or blocked
 
         reasons = []
         if unsafe_contact:
@@ -229,7 +335,11 @@ class VLNEnvWrapper:
             "unsafe_contact": unsafe_contact,
             "fall": fall,
             "blocked": blocked,
-            "cost": float(unsafe_contact) + float(fall) + float(blocked),
+            "cost": float(hard_violation) + dense_risk,
+            "hard_cost": float(hard_violation),
+            "dense_risk": dense_risk,
+            "hard_violation": hard_violation,
+            "risk_components": risk_components,
             "termination_reason": "+".join(reasons) or None,
             "contact_bodies": sorted(contact_body_forces),
             "contact_body_forces": contact_body_forces,
@@ -237,7 +347,37 @@ class VLNEnvWrapper:
             "orientation_angle": orientation,
             "blocked_steps": blocked_status.observed_steps if blocked_status else 0,
             "blocked_displacement": blocked_status.displacement if blocked_status else 0.0,
+            "front_obstacle_distance_m": obstacle_distance,
+            "planar_speed_mps": planar_speed,
         }
+
+    def begin_macro_action(self, command) -> None:
+        """Set the command-transition risk once at a high-level boundary."""
+        current = torch.as_tensor(command).reshape(-1)[:3].detach().cpu()
+        self._active_smoothness_risk = smoothness_risk(
+            self._previous_macro_command, current
+        )
+        self._previous_macro_command = current.clone()
+
+    def _write_calibration_record(self, safety) -> None:
+        if self._calibration_file is None:
+            return
+        record = {
+            "episode_id": str(self.episode.get("episode_id")),
+            "env_step": self.env_step,
+            "hard_violation": bool(safety["hard_violation"]),
+            "unsafe_contact": bool(safety["unsafe_contact"]),
+            "fall": bool(safety["fall"]),
+            "blocked": bool(safety["blocked"]),
+            "max_unsafe_contact_force": safety["max_unsafe_contact_force"],
+            "orientation_angle": safety["orientation_angle"],
+            "front_obstacle_distance_m": safety["front_obstacle_distance_m"],
+            "planar_speed_mps": safety["planar_speed_mps"],
+        }
+        self._calibration_file.write(
+            json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+        )
+        self._calibration_file.flush()
 
     @property
     def unwrapped(self) -> ManagerBasedRLEnv:
@@ -275,6 +415,8 @@ class VLNEnvWrapper:
 
         self.env_step, self.same_pos_count = 0, 0
         self.blocked_detector.reset()
+        self._previous_macro_command = None
+        self._active_smoothness_risk = 0.0
         self.last_safety = self._empty_safety()
 
         self.set_measures()
@@ -338,12 +480,13 @@ class VLNEnvWrapper:
             self.last_safety = self._compute_go2_safety(
                 action, self.prev_pos, current_pos
             )
+            self._write_calibration_record(self.last_safety)
             same_pos = False
             self.prev_pos = current_pos.clone()
         else:
             self.last_safety = self._empty_safety()
             same_pos = self.check_same_pos()
-        if self.last_safety["cost"] > 0.0:
+        if self.last_safety["hard_violation"]:
             print(
                 "[SAFE-VLN] terminating "
                 f"reason={self.last_safety['termination_reason']} "
@@ -362,7 +505,7 @@ class VLNEnvWrapper:
 
         done = (
             done[0]
-            or self.last_safety["cost"] > 0.0
+            or self.last_safety["hard_violation"]
             or same_pos
             or self.env_step >= self.max_length
             or self.is_stop_called
@@ -392,5 +535,7 @@ class VLNEnvWrapper:
         self.is_stop_called = is_stop_called
 
     def close(self) -> None:
+        if self._calibration_file is not None:
+            self._calibration_file.close()
+            self._calibration_file = None
         self.env.close()
-

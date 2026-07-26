@@ -12,6 +12,8 @@ import subprocess
 import sys
 
 from safe_vln import train as pipeline
+from safe_vln.calibration import fit_cost_profile, read_calibration_records
+from safe_vln.objective import save_cost_profile
 
 
 def add_eval_args(parser):
@@ -24,7 +26,8 @@ def add_eval_args(parser):
     parser.add_argument("--end-idx", type=int)
     parser.add_argument("--vlm-host", default="localhost")
     parser.add_argument("--vlm-port", type=int, default=54321)
-    parser.add_argument("--cost-limit", type=float, default=0.0)
+    parser.add_argument("--cost-limit", type=float)
+    parser.add_argument("--safe-cost-profile")
     parser.add_argument("--blocked-seconds", type=float, default=2.0)
     parser.add_argument("--blocked-distance", type=float, default=0.10)
     parser.add_argument("--dataset-dir")
@@ -36,6 +39,7 @@ def add_eval_args(parser):
     parser.add_argument("--safe-policy-tag")
     parser.add_argument("--max-vlm-calls", type=int)
     parser.add_argument("--max-episode-seconds", type=float)
+    parser.add_argument("--calibration-dir")
 
 
 def _python_launcher():
@@ -122,10 +126,25 @@ def run_episodes(args):
             f"--vlm_host={args.vlm_host}",
             f"--vlm_port={args.vlm_port}",
             "--safe-vln",
-            f"--safe-cost-limit={args.cost_limit}",
             f"--safe-blocked-seconds={args.blocked_seconds}",
             f"--safe-blocked-distance={args.blocked_distance}",
         ]
+        if args.cost_limit is not None:
+            command.append(f"--safe-cost-limit={args.cost_limit}")
+        if args.safe_cost_profile:
+            command.append(f"--safe-cost-profile={args.safe_cost_profile}")
+        if args.calibration_dir:
+            calibration_dir = Path(args.calibration_dir).expanduser()
+            calibration_dir.mkdir(parents=True, exist_ok=True)
+            replay_label = (
+                replay_ids[index - args.start_idx]
+                if replay_ids is not None
+                else index
+            )
+            command.append(
+                "--safe-calibration-file="
+                f"{calibration_dir / f'episode_{replay_label}.jsonl'}"
+            )
         if args.safe_replay:
             replay_id = replay_ids[index - args.start_idx]
             command.extend(
@@ -161,7 +180,13 @@ def summarize(args):
     files = sorted(Path(args.measurement_dir).glob("*.json"))
     if not files:
         raise RuntimeError("no measurement JSON files found")
-    rows = [json.loads(path.read_text(encoding="utf-8")) for path in files]
+    payloads = [json.loads(path.read_text(encoding="utf-8")) for path in files]
+    rows = [
+        payload.get("summary", payload)
+        if isinstance(payload, dict)
+        else {}
+        for payload in payloads
+    ]
 
     def mean(key):
         return sum(float(row.get(key, 0.0) or 0.0) for row in rows) / len(rows)
@@ -179,6 +204,13 @@ def summarize(args):
         "safe_spl": mean("safe_spl"),
         "mean_reward": mean("total_high_level_reward"),
         "mean_cost": mean("cumulative_cost"),
+        "mean_hard_cost": mean("cumulative_hard_cost"),
+        "mean_dense_cost": mean("cumulative_dense_cost"),
+        "hard_violation_rate": sum(
+            float(row.get("cumulative_hard_cost", 0.0) or 0.0) > 0
+            for row in rows
+        )
+        / len(rows),
         "zero_cost_rate": sum(cost == 0 for cost in costs) / len(costs),
         "collision_rate": mean("has_collision"),
         "blocked_rate": mean("has_blocked"),
@@ -207,10 +239,11 @@ def add_model_args(parser, *, train=False):
     parser.add_argument("--split", default="train")
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--reset-critics", action="store_true")
     if train:
         parser.add_argument("--rollout-dir", required=True)
         parser.add_argument("--actor-lr", type=float, default=1e-5)
-        parser.add_argument("--cost-limit", type=float, default=0.1)
+        parser.add_argument("--cost-limit", type=float)
         parser.add_argument("--clip-ratio", type=float, default=0.1)
         parser.add_argument("--ppo-epochs", type=int, default=4)
         parser.add_argument("--mini-batch-size", type=int, default=16)
@@ -232,6 +265,9 @@ def parse_args():
     add_eval_args(collect)
     evaluate = subparsers.add_parser("evaluate")
     add_eval_args(evaluate)
+    calibrate = subparsers.add_parser("calibrate-safety")
+    add_eval_args(calibrate)
+    calibrate.add_argument("--output-profile", required=True)
     warmup = subparsers.add_parser("warmup-critics")
     add_model_args(warmup)
     train = subparsers.add_parser("train")
@@ -250,6 +286,37 @@ def main():
         return run_episodes(args)
     if args.command == "evaluate":
         return run_episodes(args)
+    if args.command == "calibrate-safety":
+        if not args.safe_replay or args.safe_replay_ids is None:
+            raise ValueError(
+                "calibrate-safety requires --safe-replay and --safe-replay-ids"
+            )
+        if len(args.safe_replay_ids) != 80:
+            raise ValueError("calibrate-safety requires exactly 80 replay episodes")
+        if not args.calibration_dir:
+            raise ValueError("calibrate-safety requires --calibration-dir")
+        calibration_dir = Path(args.calibration_dir).expanduser()
+        if calibration_dir.exists() and any(calibration_dir.glob("*.jsonl")):
+            raise ValueError(
+                "calibration directory already contains JSONL records; "
+                "use a new directory"
+            )
+        result = run_episodes(args)
+        if result:
+            return result
+        calibration_files = sorted(calibration_dir.glob("*.jsonl"))
+        if len(calibration_files) != 80:
+            raise RuntimeError(
+                f"expected 80 calibration files, found {len(calibration_files)}"
+            )
+        profile = fit_cost_profile(
+            read_calibration_records(calibration_dir),
+            calibration_episodes=80,
+            minimum_recorded_episodes=20,
+        )
+        output = save_cost_profile(profile, args.output_profile)
+        print(json.dumps({"cost_profile": str(output), "fingerprint": profile["fingerprint"]}))
+        return 0
     if args.command == "warmup-critics":
         return pipeline.warmup(args)
     if args.command == "train":

@@ -136,6 +136,9 @@ def normalize_policy_response(response: Any) -> dict[str, Any]:
             "cost_value": _finite_optional_float(response.get("cost_value")) if structured else None,
             "log_prob": _finite_optional_float(response.get("log_prob")) if structured else None,
             "policy_version": response.get("policy_version") if structured else None,
+            "objective_fingerprint": (
+                response.get("objective_fingerprint") if structured else None
+            ),
             "decision_id": response.get("decision_id") if structured else None,
             "action_probabilities": (
                 _action_probabilities(response.get("action_probabilities"))

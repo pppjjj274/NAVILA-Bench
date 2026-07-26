@@ -23,6 +23,13 @@ from omni.isaac.lab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
+from safe_vln.objective import (
+    build_objective_config,
+    canonical_fingerprint,
+    default_cost_profile,
+    load_cost_profile,
+    validate_cost_profile,
+)
 from safe_vln.replay import load_r2r_replay_episode
 
 # isaaclab argparse arguments
@@ -47,7 +54,9 @@ parser.add_argument("--max_episode_seconds", type=float, default=None)
 parser.add_argument("--max_vlm_calls", type=int, default=None)
 parser.add_argument("--safe-vln", action="store_true", help="Enable Go2 CMDP safety evaluation and trajectory output.")
 parser.add_argument("--safe-gamma", type=float, default=0.99)
-parser.add_argument("--safe-cost-limit", type=float, default=0.0)
+parser.add_argument("--safe-cost-limit", type=float, default=None)
+parser.add_argument("--safe-cost-profile", type=str, default=None)
+parser.add_argument("--safe-calibration-file", type=str, default=None)
 parser.add_argument("--safe-contact-threshold", type=float, default=1.0)
 parser.add_argument("--safe-orientation-limit", type=float, default=0.8)
 parser.add_argument("--safe-blocked-seconds", type=float, default=2.0)
@@ -55,6 +64,7 @@ parser.add_argument("--safe-blocked-distance", type=float, default=0.10)
 parser.add_argument("--progress-reward-scale", type=float, default=1.0)
 parser.add_argument("--success-reward", type=float, default=10.0)
 parser.add_argument("--macro-step-penalty", type=float, default=-0.01)
+parser.add_argument("--failed-stop-penalty", type=float, default=-1.0)
 parser.add_argument("--safe-dataset-dir", type=str, default=None)
 parser.add_argument(
     "--safe-replay",
@@ -88,6 +98,8 @@ if args_cli.safe_blocked_seconds <= 0:
     parser.error("--safe-blocked-seconds must be positive")
 if args_cli.safe_blocked_distance <= 0:
     parser.error("--safe-blocked-distance must be positive")
+if args_cli.safe_calibration_file and not args_cli.safe_vln:
+    parser.error("--safe-calibration-file requires --safe-vln")
 if args_cli.safe_policy_tag is not None:
     if not args_cli.safe_vln:
         parser.error("--safe-policy-tag requires --safe-vln")
@@ -115,6 +127,41 @@ if args_cli.safe_replay:
         annotations_path=args_cli.safe_replay_annotations,
     )
 
+if args_cli.safe_cost_profile:
+    safe_cost_profile = load_cost_profile(args_cli.safe_cost_profile)
+else:
+    profile_payload = default_cost_profile()
+    profile_payload.pop("fingerprint", None)
+    profile_payload["hard_thresholds"].update(
+        {
+            "contact_force_n": args_cli.safe_contact_threshold,
+            "orientation_rad": args_cli.safe_orientation_limit,
+            "blocked_seconds": args_cli.safe_blocked_seconds,
+            "blocked_distance_m": args_cli.safe_blocked_distance,
+        }
+    )
+    safe_cost_profile = validate_cost_profile(profile_payload)
+if args_cli.safe_cost_limit is None:
+    args_cli.safe_cost_limit = float(safe_cost_profile["cost_limit"])
+else:
+    safe_cost_profile = dict(safe_cost_profile)
+    safe_cost_profile.pop("fingerprint", None)
+    safe_cost_profile["cost_limit"] = float(args_cli.safe_cost_limit)
+    safe_cost_profile = validate_cost_profile(safe_cost_profile)
+safe_objective_config = build_objective_config(safe_cost_profile)
+safe_objective_config["online_reward"].update(
+    {
+        "progress_scale": float(args_cli.progress_reward_scale),
+        "macro_step_penalty": float(args_cli.macro_step_penalty),
+        "success_reward": float(args_cli.success_reward),
+        "failed_stop_penalty": float(args_cli.failed_stop_penalty),
+    }
+)
+safe_objective_config.pop("fingerprint", None)
+safe_objective_config["fingerprint"] = canonical_fingerprint(
+    safe_objective_config
+)
+
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -129,6 +176,7 @@ from PIL import ImageDraw
 from safe_vln.actions import normalize_policy_response
 from safe_vln.checkpoint import load_go2_inference_checkpoint
 from safe_vln.dataset import SafeVLNShardWriter, write_episode_summary
+from safe_vln.objective import graded_oracle_reward
 from safe_vln.trajectory import SafeTrajectoryRecorder
 
 from rsl_rl.runners import OnPolicyRunner
@@ -370,9 +418,13 @@ def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
         instruction=replay_episode.instruction,
         gamma=args_cli.safe_gamma,
         cost_limit=args_cli.safe_cost_limit,
+        objective_config=safe_objective_config,
     )
     dataset_writer = (
-        SafeVLNShardWriter(args_cli.safe_dataset_dir)
+        SafeVLNShardWriter(
+            args_cli.safe_dataset_dir,
+            objective_config=safe_objective_config,
+        )
         if args_cli.safe_dataset_dir
         else None
     )
@@ -403,7 +455,7 @@ def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
                 args_cli.vlm_port,
                 replay_episode.instruction,
                 request_metadata={
-                    "protocol_version": "safe-vln-go2-v1",
+                    "protocol_version": "safe-vln-go2-v2",
                     "mode": "act",
                     "episode_id": replay_run_id,
                     "replay_episode_id": str(replay_episode.episode_id),
@@ -419,7 +471,11 @@ def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
                 not policy_output["invalid_action"]
                 and policy_output["action_id"] == oracle_action.action_id
             )
-            oracle_reward = float(action_match)
+            oracle_reward, oracle_reward_components = graded_oracle_reward(
+                policy_output["action_id"],
+                oracle_action.action_id,
+                invalid_action=policy_output["invalid_action"],
+            )
             recorder.begin(policy_output, _measurement_distance(infos))
             print(
                 f"Safe-Replay output: {response}\n"
@@ -442,12 +498,13 @@ def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
                 command = torch.tensor(
                     policy_output["velocity_command"], device=obs.device
                 )
+                env.begin_macro_action(command)
                 for _ in range(requested_steps):
                     obs, _, done, infos = env.step(command)
-                    recorder.count_env_step()
                     num_steps += 1
                     safety = infos.get("safety", {})
-                    if safety.get("cost", 0.0) > 0:
+                    recorder.record_env_step(safety)
+                    if safety.get("hard_violation", False):
                         termination_reason = safety["termination_reason"]
                     elif done:
                         termination_reason = "environment_termination"
@@ -467,7 +524,7 @@ def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
             recorder.finish(
                 distance_after=_measurement_distance(infos),
                 reward_override=oracle_reward,
-                reward_components={"oracle_action_match": oracle_reward},
+                reward_components=oracle_reward_components,
                 unsafe_contact=bool(safety.get("unsafe_contact", False)),
                 fall=bool(safety.get("fall", False)),
                 blocked=bool(safety.get("blocked", False)),
@@ -497,7 +554,8 @@ def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
                     "oracle_action_text": oracle_action.text,
                     "raw_oracle_action": replay_step.raw_oracle_action,
                     "action_match": action_match,
-                    "reward_source": "oracle_action_match",
+                    "reward_source": "graded_oracle_action",
+                    "graded_oracle_reward": oracle_reward,
                     "observation_alignment": "offline_unpaired",
                     "navigation_metrics_aligned": False,
                     "policy_tag": args_cli.safe_policy_tag,
@@ -550,7 +608,7 @@ def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
                     "physical_episode_id": str(physical_episode["episode_id"]),
                     "observation_alignment": "offline_unpaired",
                     "navigation_metrics_aligned": False,
-                    "reward_source": "oracle_action_match",
+                    "reward_source": "graded_oracle_action",
                     "policy_tag": args_cli.safe_policy_tag,
                     "policy_version": _recorded_policy_version(recorder),
                 }
@@ -568,12 +626,17 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
         progress_scale=args_cli.progress_reward_scale,
         step_penalty=args_cli.macro_step_penalty,
         success_reward=args_cli.success_reward,
+        failed_stop_penalty=args_cli.failed_stop_penalty,
         cost_limit=args_cli.safe_cost_limit,
+        objective_config=safe_objective_config,
     )
     dataset_writer = None
     dataset_samples = []
     if args_cli.safe_dataset_dir:
-        dataset_writer = SafeVLNShardWriter(args_cli.safe_dataset_dir)
+        dataset_writer = SafeVLNShardWriter(
+            args_cli.safe_dataset_dir,
+            objective_config=safe_objective_config,
+        )
 
     step_dt = env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation
     steps_per_image = max(1, round(0.5 / step_dt))
@@ -599,7 +662,7 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
                 args_cli.vlm_port,
                 instruction.instruction_text,
                 request_metadata={
-                    "protocol_version": "safe-vln-go2-v1",
+                    "protocol_version": "safe-vln-go2-v2",
                     "mode": "act",
                     "episode_id": str(episode["episode_id"]),
                     "transition_index": len(recorder.transitions),
@@ -624,6 +687,7 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
                 recorder.finish(
                     distance_after=_measurement_distance(infos),
                     success=success,
+                    failed_stop=not success,
                     terminated=True,
                     termination_reason="success" if success else "failed_stop",
                 )
@@ -631,10 +695,12 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
             else:
                 requested_steps = max(1, round(policy_output["duration"] / step_dt))
                 command = torch.tensor(policy_output["velocity_command"], device=obs.device)
+                env.begin_macro_action(command)
                 for _ in range(requested_steps):
                     obs, _, done, infos = env.step(command)
-                    recorder.count_env_step()
                     num_steps += 1
+                    safety = infos.get("safety", {})
+                    recorder.record_env_step(safety)
 
                     if num_steps % steps_per_image == 0:
                         frame = infos["observations"]["camera_obs"][0, :, :, :3].cpu().numpy()
@@ -646,8 +712,7 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
                         add_instruction_on_img(viz_frame, action_text)
                         rgb_obses.append(np.concatenate([camera_frame, viz_frame], axis=1))
 
-                    safety = infos.get("safety", {})
-                    if safety.get("cost", 0.0) > 0:
+                    if safety.get("hard_violation", False):
                         termination_reason = safety["termination_reason"]
                     elif done:
                         termination_reason = "environment_termination"
@@ -814,7 +879,9 @@ def main():
                         contact_threshold=args_cli.safe_contact_threshold,
                         orientation_limit=args_cli.safe_orientation_limit,
                         blocked_seconds=args_cli.safe_blocked_seconds,
-                        blocked_distance=args_cli.safe_blocked_distance)
+                        blocked_distance=args_cli.safe_blocked_distance,
+                        cost_profile=safe_cost_profile,
+                        calibration_file=args_cli.safe_calibration_file)
     
     if not args_cli.safe_replay:
         # set view pos and target
@@ -841,7 +908,7 @@ def main():
                 "physical_episode_id": str(episode["episode_id"]),
                 "observation_alignment": "offline_unpaired",
                 "navigation_metrics_aligned": False,
-                "reward_source": "oracle_action_match",
+                "reward_source": "graded_oracle_action",
                 "policy_tag": args_cli.safe_policy_tag,
                 "policy_version": _recorded_policy_version(recorder),
             }
@@ -853,7 +920,7 @@ def main():
                 "physical_episode_id": str(episode["episode_id"]),
                 "observation_alignment": "offline_unpaired",
                 "navigation_metrics_aligned": False,
-                "reward_source": "oracle_action_match",
+                "reward_source": "graded_oracle_action",
                 "policy_tag": args_cli.safe_policy_tag,
                 "policy_version": _recorded_policy_version(recorder),
             }

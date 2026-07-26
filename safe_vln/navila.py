@@ -59,6 +59,7 @@ def load_safe_navila(
     dtype: torch.dtype = torch.bfloat16,
     add_lora: bool = True,
     checkpoint: str | None = None,
+    reset_critics: bool = False,
 ):
     from llava.mm_utils import get_model_name_from_path
     from llava.model.builder import load_pretrained_model
@@ -79,7 +80,7 @@ def load_safe_navila(
     # memory footprint while providing the exponent range needed for training.
     base_model = base_model.to(device=device, dtype=dtype)
     safe_model = SafeNavilaActorCritic(base_model, tokenizer).to(device)
-    if checkpoint:
+    if checkpoint and not reset_critics:
         safe_model.load_safe_heads(checkpoint, map_location=device)
     preprocessor = NavilaStatePreprocessor(
         tokenizer,
