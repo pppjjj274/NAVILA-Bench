@@ -16,7 +16,7 @@ import time
 import base64
 import io
 import socket
-import json
+import uuid
 
 
 from omni.isaac.lab.app import AppLauncher
@@ -30,7 +30,22 @@ from safe_vln.objective import (
     load_cost_profile,
     validate_cost_profile,
 )
-from safe_vln.replay import load_r2r_replay_episode
+from safe_vln.replay import (
+    DEFAULT_VLNCE_TRAIN_METADATA,
+    load_r2r_replay_episode,
+    load_vlnce_episode_metadata,
+)
+from safe_vln.live_render import (
+    DEFAULT_RENDER_PORT,
+    DEFAULT_RENDER_TIMEOUT_SECONDS,
+    HabitatRenderClient,
+    LIVE_SCHEMA_VERSION,
+    habitat_yaw_to_isaac_yaw,
+    isaac_position_to_habitat,
+    isaac_wxyz_to_yaw,
+    isaac_yaw_to_habitat_yaw,
+    navigation_alignment_error,
+)
 
 # isaaclab argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -65,6 +80,20 @@ parser.add_argument("--progress-reward-scale", type=float, default=1.0)
 parser.add_argument("--success-reward", type=float, default=10.0)
 parser.add_argument("--macro-step-penalty", type=float, default=-0.01)
 parser.add_argument("--failed-stop-penalty", type=float, default=-1.0)
+parser.add_argument("--missed-stop-penalty", type=float, default=-0.5)
+parser.add_argument("--missed-stop-patience", type=int, default=3)
+parser.add_argument(
+    "--goal-stop-mode",
+    choices=("policy", "shield"),
+    default="policy",
+    help="Raw policy execution or goal-radius STOP safety shield.",
+)
+parser.add_argument(
+    "--collection-policy",
+    choices=("vlm", "oracle"),
+    default="vlm",
+    help="Use the VLM policy or the live dynamic oracle for data collection.",
+)
 parser.add_argument("--safe-dataset-dir", type=str, default=None)
 parser.add_argument(
     "--safe-replay",
@@ -75,10 +104,57 @@ parser.add_argument("--safe-replay-root", type=str, default=None)
 parser.add_argument("--safe-replay-annotations", type=str, default=None)
 parser.add_argument("--safe-replay-id", type=int, default=None)
 parser.add_argument(
+    "--safe-replay-vlnce-metadata",
+    type=str,
+    default=str(DEFAULT_VLNCE_TRAIN_METADATA),
+    help=(
+        "Original VLN-CE split JSON.GZ used to align the replay ID with its "
+        "Matterport scene, start pose, goal, and reference path."
+    ),
+)
+parser.add_argument(
+    "--safe-replay-vlnce-gt",
+    type=str,
+    default=None,
+    help="Optional VLN-CE split_gt.json.gz override (defaults beside metadata).",
+)
+parser.add_argument(
+    "--safe-replay-legacy-unpaired",
+    action="store_true",
+    help=(
+        "Retain the old independent --episode_idx physical episode instead "
+        "of loading the matching original VLN-CE episode."
+    ),
+)
+parser.add_argument(
     "--safe-policy-tag",
     type=str,
     default=None,
     help="Filesystem-safe policy label added to Safe-Replay IDs and outputs.",
+)
+parser.add_argument(
+    "--safe-live-render",
+    action="store_true",
+    help=(
+        "Render NaViLA RGB observations from the live Go2 pose in a separate "
+        "headless Habitat-Sim process."
+    ),
+)
+parser.add_argument("--render-host", type=str, default="127.0.0.1")
+parser.add_argument("--render-port", type=int, default=DEFAULT_RENDER_PORT)
+parser.add_argument(
+    "--render-timeout-seconds",
+    type=float,
+    default=DEFAULT_RENDER_TIMEOUT_SECONDS,
+)
+parser.add_argument("--mp3d-scenes-root", type=str, default=None)
+parser.add_argument("--vlnce-episode-id", type=int, default=None)
+parser.add_argument("--vlnce-metadata", type=str, default=None)
+parser.add_argument("--vlnce-gt", type=str, default=None)
+parser.add_argument(
+    "--dataset-role",
+    choices=("train", "eval"),
+    default="train",
 )
 
 
@@ -98,6 +174,8 @@ if args_cli.safe_blocked_seconds <= 0:
     parser.error("--safe-blocked-seconds must be positive")
 if args_cli.safe_blocked_distance <= 0:
     parser.error("--safe-blocked-distance must be positive")
+if args_cli.missed_stop_patience <= 0:
+    parser.error("--missed-stop-patience must be positive")
 if args_cli.safe_calibration_file and not args_cli.safe_vln:
     parser.error("--safe-calibration-file requires --safe-vln")
 if args_cli.safe_policy_tag is not None:
@@ -107,6 +185,43 @@ if args_cli.safe_policy_tag is not None:
         parser.error(
             "--safe-policy-tag may contain only letters, digits, '.', '_' and '-'"
         )
+if args_cli.safe_live_render:
+    if not args_cli.safe_vln:
+        parser.error("--safe-live-render requires --safe-vln")
+    if args_cli.safe_replay:
+        parser.error("--safe-live-render cannot be combined with --safe-replay")
+    if getattr(args_cli, "enable_cameras", False):
+        parser.error("--safe-live-render cannot be combined with --enable_cameras")
+    if not getattr(args_cli, "headless", False):
+        parser.error("--safe-live-render requires --headless")
+    if args_cli.vlnce_episode_id is None or args_cli.vlnce_metadata is None:
+        parser.error(
+            "--safe-live-render requires --vlnce-episode-id and --vlnce-metadata"
+        )
+    if args_cli.mp3d_scenes_root is None:
+        parser.error("--safe-live-render requires --mp3d-scenes-root")
+    if not 0 < args_cli.render_port < 65536:
+        parser.error("--render-port must be in [1, 65535]")
+    if args_cli.render_timeout_seconds <= 0:
+        parser.error("--render-timeout-seconds must be positive")
+    metadata_split = os.path.basename(
+        os.path.dirname(os.path.abspath(args_cli.vlnce_metadata))
+    )
+    if metadata_split == "val_unseen" and args_cli.dataset_role != "eval":
+        parser.error("val_unseen live-render data requires --dataset-role=eval")
+    if args_cli.collection_policy == "oracle" and args_cli.dataset_role != "train":
+        parser.error("--collection-policy=oracle is allowed only for train data")
+    if (
+        args_cli.collection_policy == "oracle"
+        and args_cli.goal_stop_mode == "shield"
+    ):
+        parser.error("--collection-policy=oracle cannot be combined with shield mode")
+elif (
+    args_cli.vlnce_episode_id is not None
+    or args_cli.vlnce_metadata is not None
+    or args_cli.vlnce_gt is not None
+):
+    parser.error("VLN-CE live metadata arguments require --safe-live-render")
 if args_cli.safe_replay:
     if not args_cli.safe_vln:
         parser.error("--safe-replay requires --safe-vln")
@@ -120,12 +235,45 @@ if args_cli.safe_replay:
         parser.error("--safe-replay requires --headless")
 
 replay_episode_preflight = None
+replay_vlnce_metadata_preflight = None
+live_vlnce_metadata_preflight = None
 if args_cli.safe_replay:
     replay_episode_preflight = load_r2r_replay_episode(
         args_cli.safe_replay_root,
         args_cli.safe_replay_id,
         annotations_path=args_cli.safe_replay_annotations,
     )
+    if not args_cli.safe_replay_legacy_unpaired:
+        replay_vlnce_metadata_preflight = load_vlnce_episode_metadata(
+            args_cli.safe_replay_vlnce_metadata,
+            args_cli.safe_replay_id,
+            gt_path=args_cli.safe_replay_vlnce_gt,
+        )
+        if (
+            replay_episode_preflight.instruction.strip()
+            != replay_vlnce_metadata_preflight.instruction.strip()
+        ):
+            parser.error(
+                "Safe-Replay annotation instruction does not match the "
+                "original VLN-CE episode metadata"
+            )
+if args_cli.safe_live_render:
+    live_vlnce_metadata_preflight = load_vlnce_episode_metadata(
+        args_cli.vlnce_metadata,
+        args_cli.vlnce_episode_id,
+        gt_path=args_cli.vlnce_gt,
+    )
+    scenes_root = os.path.abspath(os.path.expanduser(args_cli.mp3d_scenes_root))
+    live_scene_glb = os.path.join(
+        scenes_root,
+        live_vlnce_metadata_preflight.scene_name,
+        f"{live_vlnce_metadata_preflight.scene_name}.glb",
+    )
+    live_scene_navmesh = os.path.splitext(live_scene_glb)[0] + ".navmesh"
+    if not os.path.isfile(live_scene_glb):
+        parser.error(f"live-render MP3D GLB does not exist: {live_scene_glb}")
+    if not os.path.isfile(live_scene_navmesh):
+        parser.error(f"live-render MP3D navmesh does not exist: {live_scene_navmesh}")
 
 if args_cli.safe_cost_profile:
     safe_cost_profile = load_cost_profile(args_cli.safe_cost_profile)
@@ -155,6 +303,8 @@ safe_objective_config["online_reward"].update(
         "macro_step_penalty": float(args_cli.macro_step_penalty),
         "success_reward": float(args_cli.success_reward),
         "failed_stop_penalty": float(args_cli.failed_stop_penalty),
+        "missed_stop_penalty": float(args_cli.missed_stop_penalty),
+        "missed_stop_patience": int(args_cli.missed_stop_patience),
     }
 )
 safe_objective_config.pop("fingerprint", None)
@@ -173,10 +323,19 @@ import torch
 from PIL import Image
 from PIL import ImageDraw
 
-from safe_vln.actions import normalize_policy_response
+from safe_vln.actions import (
+    action_from_id,
+    has_valid_policy_statistics,
+    normalize_policy_response,
+)
 from safe_vln.checkpoint import load_go2_inference_checkpoint
-from safe_vln.dataset import SafeVLNShardWriter, write_episode_summary
+from safe_vln.dataset import (
+    SafeVLNEpisodeWriter,
+    SafeVLNShardWriter,
+    write_episode_summary,
+)
 from safe_vln.objective import graded_oracle_reward
+from safe_vln.goal_stop import GoalStopController
 from safe_vln.trajectory import SafeTrajectoryRecorder
 
 from rsl_rl.runners import OnPolicyRunner
@@ -241,7 +400,15 @@ def define_markers() -> VisualizationMarkers:
 
 def reset_start_pos_rot(env_cfg, args_cli, episode):
     scene_id = os.path.splitext(os.path.basename(episode["scene_id"]))[0]
-    env_cfg.scene.terrain.obj_filepath = os.path.join(ASSETS_DIR, f"matterport_usd/{scene_id}/{scene_id}.usd")
+    scene_path = os.path.join(
+        ASSETS_DIR, f"matterport_usd/{scene_id}/{scene_id}.usd"
+    )
+    if not os.path.isfile(scene_path):
+        raise FileNotFoundError(
+            f"Matterport USD scene for episode {episode['episode_id']} "
+            f"does not exist: {scene_path}"
+        )
+    env_cfg.scene.terrain.obj_filepath = scene_path
     
     start_pos, start_rot, goal_pos = episode["start_position"], episode["start_rotation"], episode["reference_path"][-1]
     env_cfg.scene.robot.init_state.rot = start_rot
@@ -374,13 +541,616 @@ def _recorded_policy_version(recorder):
     return next(iter(versions), None)
 
 
-def _replay_diagnostic_frame(frame, *, instruction, predicted, oracle, reward, cost, reason):
+def _robot_pose(env):
+    robot = env.unwrapped.scene["robot"].data
+    position = robot.root_pos_w[0].detach().cpu().tolist()
+    rotation = robot.root_quat_w[0].detach().cpu().tolist()
+    yaw = isaac_wxyz_to_yaw(rotation)
+    return {
+        "position": [float(value) for value in position],
+        "rotation_wxyz": [float(value) for value in rotation],
+        "yaw": float(yaw),
+    }
+
+
+def _sample_live_history(history):
+    if not history:
+        raise RuntimeError("strict live-render history is empty")
+    selected = list(history[-8:])
+    if len(selected) < 8:
+        selected = [selected[0]] * (8 - len(selected)) + selected
+    return selected
+
+
+def _render_live_frame(
+    env,
+    render_client,
+    vlnce_metadata,
+    *,
+    physics_step,
+    transition_index,
+    frame_index,
+):
+    before = _robot_pose(env)
+    habitat_position = isaac_position_to_habitat(before["position"])
+    habitat_yaw = isaac_yaw_to_habitat_yaw(before["yaw"])
+    request_id = (
+        f"{vlnce_metadata.episode_id}-{transition_index}-{frame_index}-"
+        f"{uuid.uuid4().hex}"
+    )
+    rendered = render_client.render(
+        {
+            "request_id": request_id,
+            "episode_id": str(vlnce_metadata.episode_id),
+            "scene_id": vlnce_metadata.scene_name,
+            "physics_step": int(physics_step),
+            "isaac_pose": before,
+            "habitat_position": list(habitat_position),
+            "habitat_yaw": habitat_yaw,
+            "goal_position": list(vlnce_metadata.goal_position_habitat),
+            "success_distance_m": float(vlnce_metadata.goal_radius),
+        }
+    )
+    after = _robot_pose(env)
+    response = rendered.metadata
+    if response.get("request_id") != request_id:
+        raise RuntimeError("Habitat renderer request_id mismatch")
+    if str(response.get("episode_id")) != str(vlnce_metadata.episode_id):
+        raise RuntimeError("Habitat renderer episode_id mismatch")
+    if response.get("scene_id") != vlnce_metadata.scene_name:
+        raise RuntimeError("Habitat renderer scene_id mismatch")
+    if int(response.get("physics_step", -1)) != int(physics_step):
+        raise RuntimeError("Habitat renderer physics_step mismatch")
+    returned_success_distance = response.get("success_distance_m")
+    if (
+        returned_success_distance is None
+        or not math.isclose(
+            float(returned_success_distance),
+            float(vlnce_metadata.goal_radius),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+    ):
+        raise RuntimeError("Habitat renderer goal radius mismatch")
+    applied_pose = response.get("applied_pose")
+    if not isinstance(applied_pose, dict):
+        raise RuntimeError("Habitat renderer did not report its applied pose")
+    position_error, yaw_error = navigation_alignment_error(
+        before["position"],
+        before["yaw"],
+        applied_pose["position"],
+        applied_pose["yaw"],
+    )
+    paused_position_error = float(
+        np.linalg.norm(
+            np.asarray(before["position"], dtype=np.float64)
+            - np.asarray(after["position"], dtype=np.float64)
+        )
+    )
+    paused_yaw_error = abs(
+        math.atan2(
+            math.sin(before["yaw"] - after["yaw"]),
+            math.cos(before["yaw"] - after["yaw"]),
+        )
+    )
+    strict = bool(
+        position_error <= 0.02
+        and yaw_error <= math.radians(1.0)
+        and paused_position_error <= 1e-6
+        and paused_yaw_error <= 1e-6
+    )
+    if not strict:
+        raise RuntimeError(
+            "strict live-render alignment failed: "
+            f"position={position_error:.6f}m yaw={math.degrees(yaw_error):.4f}deg "
+            f"paused_position={paused_position_error:.8f}m "
+            f"paused_yaw={math.degrees(paused_yaw_error):.6f}deg"
+        )
+    metadata = {
+        "request_id": request_id,
+        "physics_step": int(physics_step),
+        "isaac_pose": before,
+        "habitat_requested_pose": {
+            "position": list(habitat_position),
+            "yaw": habitat_yaw,
+        },
+        "habitat_applied_pose": applied_pose,
+        "horizontal_position_error_m": position_error,
+        "yaw_error_rad": yaw_error,
+        "physics_paused_position_error_m": paused_position_error,
+        "physics_paused_yaw_error_rad": paused_yaw_error,
+        "strict_observation_state_alignment": True,
+        "nearest_navmesh_point": response.get("nearest_navmesh_point"),
+        "navmesh_snap_distance": response.get("navmesh_snap_distance"),
+        "is_navigable": bool(response.get("is_navigable", False)),
+        "geodesic_distance": response.get("geodesic_distance"),
+        "navigation_reward_valid": bool(
+            response.get("navigation_reward_valid", False)
+        ),
+        "success_distance_m": float(returned_success_distance),
+        "dynamic_oracle_action": response.get("dynamic_oracle_action"),
+        "oracle_valid": bool(response.get("oracle_valid", False)),
+        "render_latency_ms": response.get("render_latency_ms"),
+        "camera": response.get("camera"),
+    }
+    return {"image": rendered.image, "metadata": metadata}
+
+
+def _live_output_metadata(vlnce_metadata, *, policy_version):
+    return {
+        "schema_version": LIVE_SCHEMA_VERSION,
+        "vlnce_episode_id": str(vlnce_metadata.episode_id),
+        "vlnce_scene_id": vlnce_metadata.scene_name,
+        "episode_metadata_aligned": True,
+        "observation_alignment": "live_habitat_from_go2_pose",
+        "navigation_metrics_aligned": True,
+        "strict_observation_state_alignment": True,
+        "alignment_scope": "navigation_pose_xy_yaw",
+        "camera_pose_policy": "navila_upright_1.25m",
+        "physical_episode_source": "original_vlnce_episode",
+        "reward_source": "live_habitat_geodesic_progress",
+        "navmesh_source": "locally_recomputed_habitat_sim_0.1.7",
+        "dataset_role": args_cli.dataset_role,
+        "policy_tag": args_cli.safe_policy_tag,
+        "policy_version": policy_version,
+        "goal_radius_m": float(vlnce_metadata.goal_radius),
+        "goal_stop_mode": args_cli.goal_stop_mode,
+        "collection_policy": args_cli.collection_policy,
+        "missed_stop_patience": int(args_cli.missed_stop_patience),
+        "vlnce_alignment": vlnce_metadata.alignment_record(),
+    }
+
+
+def run_safe_live_render_episode(
+    env,
+    obs,
+    infos,
+    physical_episode,
+    vlnce_metadata,
+):
+    """Run Go2 physics with RGB/geodesics rendered from each actual pose."""
+    render_client = HabitatRenderClient(
+        args_cli.render_host,
+        args_cli.render_port,
+        timeout_seconds=args_cli.render_timeout_seconds,
+    )
+    health = render_client.health()
+    print(
+        f"[SAFE-LIVE] renderer ready: habitat={health.get('habitat_sim_version')} "
+        f"root={health.get('scenes_root')}",
+        flush=True,
+    )
+    episode_id = str(vlnce_metadata.episode_id)
+    recorder = SafeTrajectoryRecorder(
+        episode_id=episode_id,
+        scene_id=physical_episode["scene_id"],
+        instruction=vlnce_metadata.instruction,
+        gamma=args_cli.safe_gamma,
+        progress_scale=args_cli.progress_reward_scale,
+        step_penalty=args_cli.macro_step_penalty,
+        success_reward=args_cli.success_reward,
+        failed_stop_penalty=args_cli.failed_stop_penalty,
+        missed_stop_penalty=args_cli.missed_stop_penalty,
+        cost_limit=args_cli.safe_cost_limit,
+        objective_config=safe_objective_config,
+    )
+    goal_stop = GoalStopController(
+        goal_radius=vlnce_metadata.goal_radius,
+        mode=args_cli.goal_stop_mode,
+        dataset_role=args_cli.dataset_role,
+        missed_stop_patience=args_cli.missed_stop_patience,
+    )
+    dataset_samples = []
+    diagnostic_frames = []
+    live_history = []
+    step_dt = env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation
+    render_interval_steps = max(1, round(0.5 / step_dt))
+    max_steps = round(100 * 0.5 / step_dt)
+    if args_cli.max_episode_seconds is not None:
+        max_steps = min(max_steps, round(args_cli.max_episode_seconds / step_dt))
+    num_steps = 0
+    vlm_calls = 0
+    terminal = False
+    termination_reason = None
+
+    initial = _render_live_frame(
+        env,
+        render_client,
+        vlnce_metadata,
+        physics_step=num_steps,
+        transition_index=0,
+        frame_index=0,
+    )
+    live_history.append(initial)
+    initial_geodesic_distance = initial["metadata"].get("geodesic_distance")
+    try:
+        while simulation_app.is_running() and not terminal and num_steps < max_steps:
+            if args_cli.max_vlm_calls is not None and vlm_calls >= args_cli.max_vlm_calls:
+                termination_reason = "max_vlm_calls"
+                break
+            sampled_entries = _sample_live_history(live_history)
+            sampled_frames = [entry["image"] for entry in sampled_entries]
+            current_frame_metadata = live_history[-1]["metadata"]
+            current_distance = current_frame_metadata.get("geodesic_distance")
+            reward_valid_before = bool(
+                current_frame_metadata["navigation_reward_valid"]
+                and current_distance is not None
+            )
+            distance_before = (
+                float(current_distance)
+                if reward_valid_before
+                else _measurement_distance(infos)
+            )
+            oracle = current_frame_metadata.get("dynamic_oracle_action")
+            if args_cli.collection_policy == "oracle":
+                if not (
+                    current_frame_metadata.get("oracle_valid", False)
+                    and isinstance(oracle, dict)
+                ):
+                    raise RuntimeError(
+                        "oracle collection encountered an invalid dynamic oracle"
+                    )
+                response = {
+                    "protocol_version": LIVE_SCHEMA_VERSION,
+                    "action_id": int(oracle["action_id"]),
+                    "action": oracle["text"],
+                    "collection_policy": "oracle",
+                }
+            else:
+                response = sample_images_and_send_to_vlm(
+                    sampled_frames,
+                    args_cli.vlm_host,
+                    args_cli.vlm_port,
+                    vlnce_metadata.instruction,
+                    request_metadata={
+                        "protocol_version": LIVE_SCHEMA_VERSION,
+                        "mode": "act",
+                        "episode_id": episode_id,
+                        "scene_id": vlnce_metadata.scene_name,
+                        "transition_index": len(recorder.transitions),
+                        "strict_observation_state_alignment": True,
+                        "deterministic": True,
+                    },
+                )
+            vlm_calls += 1
+            policy_output = normalize_policy_response(response)
+            stop_decision = goal_stop.resolve(
+                policy_output["action_id"],
+                distance_before,
+                navigation_reward_valid=reward_valid_before,
+            )
+            executed_action = action_from_id(stop_decision.executed_action_id)
+            recorder.begin(policy_output, distance_before)
+            pose_before = _robot_pose(env)
+            print(
+                f"Safe-Live output: {response}\n"
+                f"Policy action {policy_output['action_id']}: "
+                f"{policy_output['text']}\n"
+                f"Executed action {executed_action.action_id}: "
+                f"{executed_action.text}"
+                + (
+                    " [GOAL SHIELD]\n"
+                    if stop_decision.shield_intervened
+                    else "\n"
+                )
+                + f"Command: {list(executed_action.velocity_command)}, "
+                f"duration: {executed_action.duration:.2f}s\n",
+                flush=True,
+            )
+            safety = infos.get("safety", {})
+            if stop_decision.immediate_terminal:
+                success = stop_decision.success
+                env.set_stop_called(True)
+                termination_reason = stop_decision.termination_reason
+                terminal = True
+                distance_after = distance_before
+                reward_valid_after = reward_valid_before
+            else:
+                requested_steps = max(
+                    1, round(executed_action.duration / step_dt)
+                )
+                command = torch.tensor(
+                    executed_action.velocity_command, device=obs.device
+                )
+                env.begin_macro_action(command)
+                for macro_step in range(1, requested_steps + 1):
+                    obs, _, done, infos = env.step(command)
+                    num_steps += 1
+                    safety = infos.get("safety", {})
+                    recorder.record_env_step(safety)
+                    should_render = bool(
+                        macro_step % render_interval_steps == 0
+                        or macro_step == requested_steps
+                        or safety.get("hard_violation", False)
+                        or done
+                    )
+                    if should_render:
+                        live_history.append(
+                            _render_live_frame(
+                                env,
+                                render_client,
+                                vlnce_metadata,
+                                physics_step=num_steps,
+                                transition_index=len(recorder.transitions),
+                                frame_index=len(live_history),
+                            )
+                        )
+                    if safety.get("hard_violation", False):
+                        termination_reason = safety["termination_reason"]
+                    elif done:
+                        termination_reason = "environment_termination"
+                    elif num_steps >= max_steps:
+                        termination_reason = "max_episode_steps"
+                    if termination_reason:
+                        terminal = True
+                        break
+                if (
+                    not terminal
+                    and stop_decision.terminate_after_execution
+                ):
+                    terminal = True
+                    termination_reason = stop_decision.termination_reason
+                latest = live_history[-1]["metadata"]
+                distance_after_value = latest.get("geodesic_distance")
+                reward_valid_after = bool(
+                    latest["navigation_reward_valid"]
+                    and distance_after_value is not None
+                )
+                distance_after = (
+                    float(distance_after_value)
+                    if reward_valid_after
+                    else _measurement_distance(infos)
+                )
+                success = False
+
+            navigation_reward_valid = bool(
+                reward_valid_before and reward_valid_after
+            )
+            recorder.finish(
+                distance_after=distance_after,
+                reward_override=None if navigation_reward_valid else 0.0,
+                reward_components=(
+                    None
+                    if navigation_reward_valid
+                    else {"invalid_navigation_reward": 0.0}
+                ),
+                success=success,
+                failed_stop=stop_decision.failed_stop,
+                missed_stop=stop_decision.missed_stop,
+                unsafe_contact=bool(safety.get("unsafe_contact", False)),
+                fall=bool(safety.get("fall", False)),
+                blocked=bool(safety.get("blocked", False)),
+                safety_diagnostics=safety,
+                terminated=terminal and termination_reason not in {
+                    "max_episode_steps",
+                    "max_vlm_calls",
+                },
+                truncated=termination_reason in {
+                    "max_episode_steps",
+                    "max_vlm_calls",
+                },
+                termination_reason=termination_reason,
+            )
+            transition = recorder.transitions[-1]
+            policy_statistics_valid = has_valid_policy_statistics(
+                policy_output,
+                objective_fingerprint=safe_objective_config.get("fingerprint"),
+            )
+            ppo_eligible = bool(
+                args_cli.dataset_role == "train"
+                and args_cli.collection_policy == "vlm"
+                and navigation_reward_valid
+                and policy_statistics_valid
+                and not stop_decision.shield_intervened
+            )
+            transition.update(
+                {
+                    "schema_version": LIVE_SCHEMA_VERSION,
+                    "episode_id": episode_id,
+                    "physical_episode_id": episode_id,
+                    "scene_id": physical_episode["scene_id"],
+                    "instruction": vlnce_metadata.instruction,
+                    "dataset_role": args_cli.dataset_role,
+                    "observation_alignment": "live_habitat_from_go2_pose",
+                    "alignment_scope": "navigation_pose_xy_yaw",
+                    "camera_pose_policy": "navila_upright_1.25m",
+                    "strict_observation_state_alignment": True,
+                    "navigation_reward_valid": navigation_reward_valid,
+                    "policy_statistics_valid": policy_statistics_valid,
+                    "ppo_eligible": ppo_eligible,
+                    "actor_eligible": ppo_eligible,
+                    "reward_critic_eligible": bool(
+                        navigation_reward_valid
+                        and not stop_decision.shield_intervened
+                    ),
+                    "cost_critic_eligible": not stop_decision.shield_intervened,
+                    "oracle_valid": bool(
+                        current_frame_metadata.get("oracle_valid", False)
+                    ),
+                    "oracle_eligible": bool(
+                        current_frame_metadata.get("oracle_valid", False)
+                    ),
+                    "dynamic_oracle_action": oracle,
+                    "oracle_action_id": (
+                        oracle.get("action_id") if isinstance(oracle, dict) else None
+                    ),
+                    "action_match": bool(
+                        isinstance(oracle, dict)
+                        and oracle.get("action_id") == policy_output["action_id"]
+                    ),
+                    "policy_action_id": stop_decision.policy_action_id,
+                    "policy_action_text": policy_output["text"],
+                    "executed_action_id": stop_decision.executed_action_id,
+                    "executed_action_text": executed_action.text,
+                    "executed_velocity_command": list(
+                        executed_action.velocity_command
+                    ),
+                    "executed_duration": executed_action.duration,
+                    "goal_radius_m": float(vlnce_metadata.goal_radius),
+                    "goal_stop_mode": args_cli.goal_stop_mode,
+                    "collection_policy": args_cli.collection_policy,
+                    "in_goal_radius": stop_decision.in_goal_radius,
+                    "missed_stop": stop_decision.missed_stop,
+                    "consecutive_missed_stops": (
+                        stop_decision.consecutive_missed_stops
+                    ),
+                    "shield_intervened": stop_decision.shield_intervened,
+                    "policy_success": bool(
+                        stop_decision.policy_action_id == 9
+                        and stop_decision.success
+                    ),
+                    "system_success": stop_decision.success,
+                    "isaac_pose_before": pose_before,
+                    "isaac_pose_after": _robot_pose(env),
+                    "frame_alignment": [
+                        entry["metadata"] for entry in sampled_entries
+                    ],
+                    "reward_source": "live_habitat_geodesic_progress",
+                    "navmesh_source": "locally_recomputed_habitat_sim_0.1.7",
+                    "policy_tag": args_cli.safe_policy_tag,
+                }
+            )
+            transition["observation_key"] = (
+                f"episode{episode_id}/state{transition['index']:06d}"
+            )
+            transition["next_observation_key"] = (
+                None
+                if transition["done"]
+                else f"episode{episode_id}/state{transition['index'] + 1:06d}"
+            )
+            dataset_samples.append(
+                (transition["observation_key"], sampled_frames, transition)
+            )
+            diagnostic_frames.append(
+                _replay_diagnostic_frame(
+                    sampled_frames[-1],
+                    instruction=vlnce_metadata.instruction,
+                    predicted=policy_output["text"],
+                    oracle=(
+                        oracle.get("text")
+                        if isinstance(oracle, dict)
+                        else "invalid"
+                    ),
+                    reward=transition["reward"],
+                    cost=transition["cost"],
+                    reason=termination_reason,
+                    alignment="strict_live_habitat",
+                )
+            )
+        if (
+            termination_reason is None
+            and recorder.transitions
+            and not terminal
+        ):
+            termination_reason = "simulation_stopped"
+        if termination_reason in {"max_vlm_calls", "simulation_stopped"} and recorder.transitions:
+            recorder.transitions[-1]["done"] = True
+            recorder.transitions[-1]["truncated"] = True
+            recorder.transitions[-1]["termination_reason"] = termination_reason
+        recorder.finalize()
+    except Exception:
+        # No dataset writer has been opened yet, so the whole episode is
+        # automatically quarantined on any renderer/alignment failure.
+        raise
+
+    latest_distance = live_history[-1]["metadata"].get("geodesic_distance")
+    if latest_distance is not None:
+        infos["measurements"]["distance_to_goal"] = float(latest_distance)
+    infos["measurements"]["success"] = bool(
+        recorder.transitions and recorder.transitions[-1].get("system_success")
+    )
+    if (
+        initial_geodesic_distance is not None
+        and infos["measurements"]["success"]
+    ):
+        path_length = float(infos["measurements"].get("path_length", 0.0) or 0.0)
+        initial_distance = float(initial_geodesic_distance)
+        infos["measurements"]["spl"] = initial_distance / max(
+            initial_distance, path_length, 1e-8
+        )
+    else:
+        infos["measurements"]["spl"] = 0.0
+
+    if args_cli.safe_dataset_dir:
+        split = os.path.basename(
+            os.path.dirname(os.path.abspath(args_cli.vlnce_metadata))
+        )
+        with SafeVLNEpisodeWriter(
+            args_cli.safe_dataset_dir,
+            episode_id,
+            dataset_role=args_cli.dataset_role,
+            split=split,
+            schema_version=LIVE_SCHEMA_VERSION,
+            objective_config=safe_objective_config,
+        ) as writer:
+            for sample_key, frames, metadata in dataset_samples:
+                writer.add(sample_key, frames, metadata)
+        episode_data = recorder.to_dict(infos.get("measurements", {}))
+        episode_data.update(
+            _live_output_metadata(
+                vlnce_metadata,
+                policy_version=_recorded_policy_version(recorder),
+            )
+        )
+        write_episode_summary(args_cli.safe_dataset_dir, episode_data)
+    return infos, diagnostic_frames, recorder
+
+
+def _replay_alignment_flags(vlnce_metadata):
+    if vlnce_metadata is None:
+        return {
+            "episode_metadata_aligned": False,
+            "observation_alignment": "offline_unpaired",
+            "navigation_metrics_aligned": False,
+            "strict_observation_state_alignment": False,
+            "physical_episode_source": "legacy_isaac_episode_idx",
+        }
+    return {
+        "episode_metadata_aligned": True,
+        "observation_alignment": "offline_reference_same_episode",
+        "navigation_metrics_aligned": True,
+        "strict_observation_state_alignment": False,
+        "physical_episode_source": "original_vlnce_episode",
+    }
+
+
+def _replay_output_metadata(
+    replay_episode,
+    physical_episode,
+    vlnce_metadata,
+    *,
+    policy_version,
+):
+    payload = {
+        "replay_episode_id": str(replay_episode.episode_id),
+        "physical_episode_id": str(physical_episode["episode_id"]),
+        "reward_source": "graded_oracle_action",
+        "policy_tag": args_cli.safe_policy_tag,
+        "policy_version": policy_version,
+        **_replay_alignment_flags(vlnce_metadata),
+    }
+    if vlnce_metadata is not None:
+        payload["vlnce_alignment"] = vlnce_metadata.alignment_record()
+    return payload
+
+
+def _replay_diagnostic_frame(
+    frame,
+    *,
+    instruction,
+    predicted,
+    oracle,
+    reward,
+    cost,
+    reason,
+    alignment,
+):
     image = frame.convert("RGB").resize((512, 512))
     canvas = Image.new("RGB", (1024, 512), "white")
     canvas.paste(image, (0, 0))
     draw = ImageDraw.Draw(canvas)
     lines = [
-        "SAFE-REPLAY (offline visual / unpaired physics)",
+        f"SAFE-REPLAY ({alignment})",
         f"Instruction: {instruction}",
         f"Predicted: {predicted}",
         f"Oracle: {oracle}",
@@ -404,8 +1174,16 @@ def _replay_diagnostic_frame(frame, *, instruction, predicted, oracle, reward, c
     return np.asarray(canvas)
 
 
-def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
+def run_safe_replay_episode(
+    env,
+    obs,
+    infos,
+    replay_episode,
+    physical_episode,
+    vlnce_metadata,
+):
     """Run offline R2R observations against live Go2 physics and safety."""
+    alignment_flags = _replay_alignment_flags(vlnce_metadata)
     replay_run_id = (
         f"replay{replay_episode.episode_id}_physical"
         f"{physical_episode['episode_id']}"
@@ -460,6 +1238,12 @@ def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
                     "episode_id": replay_run_id,
                     "replay_episode_id": str(replay_episode.episode_id),
                     "replay_video_id": replay_step.video_id,
+                    "episode_metadata_aligned": alignment_flags[
+                        "episode_metadata_aligned"
+                    ],
+                    "observation_alignment": alignment_flags[
+                        "observation_alignment"
+                    ],
                     "transition_index": len(recorder.transitions),
                     "deterministic": True,
                 },
@@ -556,9 +1340,8 @@ def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
                     "action_match": action_match,
                     "reward_source": "graded_oracle_action",
                     "graded_oracle_reward": oracle_reward,
-                    "observation_alignment": "offline_unpaired",
-                    "navigation_metrics_aligned": False,
                     "policy_tag": args_cli.safe_policy_tag,
+                    **alignment_flags,
                 }
             )
             transition["observation_key"] = (
@@ -581,6 +1364,7 @@ def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
                     reward=transition["reward"],
                     cost=transition["cost"],
                     reason=termination_reason,
+                    alignment=alignment_flags["observation_alignment"],
                 )
             )
             if dataset_writer is not None:
@@ -603,15 +1387,12 @@ def run_safe_replay_episode(env, obs, infos, replay_episode, physical_episode):
             dataset_writer.close()
             episode_data = recorder.to_dict(infos.get("measurements", {}))
             episode_data.update(
-                {
-                    "replay_episode_id": str(replay_episode.episode_id),
-                    "physical_episode_id": str(physical_episode["episode_id"]),
-                    "observation_alignment": "offline_unpaired",
-                    "navigation_metrics_aligned": False,
-                    "reward_source": "graded_oracle_action",
-                    "policy_tag": args_cli.safe_policy_tag,
-                    "policy_version": _recorded_policy_version(recorder),
-                }
+                _replay_output_metadata(
+                    replay_episode,
+                    physical_episode,
+                    vlnce_metadata,
+                    policy_version=_recorded_policy_version(recorder),
+                )
             )
             write_episode_summary(args_cli.safe_dataset_dir, episode_data)
     return infos, diagnostic_frames, recorder
@@ -801,18 +1582,48 @@ def main():
     if args_cli.safe_vln and args_cli.task != "go2_matterport_vision":
         raise ValueError("Safe-VLN supports only --task=go2_matterport_vision")
 
-    # read R2R test episodes
-    r2r_data_path = os.path.join(ASSETS_DIR, "vln_ce_isaac_v1.json.gz")
-    all_episodes = read_episodes(r2r_data_path)
-    episode = all_episodes[args_cli.episode_idx]
     replay_episode = replay_episode_preflight
+    replay_vlnce_metadata = replay_vlnce_metadata_preflight
+    live_vlnce_metadata = live_vlnce_metadata_preflight
     if args_cli.safe_replay:
+        if replay_vlnce_metadata is not None:
+            episode = replay_vlnce_metadata.to_isaac_episode()
+            physical_description = (
+                f"matching VLN-CE episode={episode['episode_id']} "
+                f"scene={replay_vlnce_metadata.scene_name} "
+                f"start={episode['start_position']} "
+                f"goal={episode['goals'][0]['position']}"
+            )
+        else:
+            r2r_data_path = os.path.join(
+                ASSETS_DIR, "vln_ce_isaac_v1.json.gz"
+            )
+            all_episodes = read_episodes(r2r_data_path)
+            episode = all_episodes[args_cli.episode_idx]
+            physical_description = (
+                f"legacy physical Isaac episode={episode['episode_id']}"
+            )
         print(
             f"[SAFE-REPLAY] loaded replay episode {replay_episode.episode_id} "
             f"with {len(replay_episode.steps)} action points; "
-            f"physical Isaac episode={episode['episode_id']}",
+            f"{physical_description}",
             flush=True,
         )
+    elif args_cli.safe_live_render:
+        episode = live_vlnce_metadata.to_isaac_episode()
+        print(
+            f"[SAFE-LIVE] loaded VLN-CE episode={episode['episode_id']} "
+            f"scene={live_vlnce_metadata.scene_name} "
+            f"start={episode['start_position']} "
+            f"goal={episode['goals'][0]['position']}",
+            flush=True,
+        )
+    else:
+        r2r_data_path = os.path.join(
+            ASSETS_DIR, "vln_ce_isaac_v1.json.gz"
+        )
+        all_episodes = read_episodes(r2r_data_path)
+        episode = all_episodes[args_cli.episode_idx]
 
     env_cfg = parse_env_cfg(args_cli.task, num_envs=args_cli.num_envs)
 
@@ -821,10 +1632,10 @@ def main():
         # high-level wrapper must observe and record the terminal Go2 pose first.
         env_cfg.terminations.base_contact = None
         env_cfg.terminations.bad_orientation = None
-    if args_cli.safe_replay:
-        # Offline replay replaces every high-level RGB observation. Removing
-        # both sensors and their observation groups keeps Isaac camera/RTX
-        # extensions out of the runtime while preserving LiDAR locomotion.
+    if args_cli.safe_replay or args_cli.safe_live_render:
+        # Offline replay and live Habitat rendering replace every high-level
+        # Isaac RGB observation. Removing both sensors keeps RTX/viewport
+        # extensions out of the A800 runtime while preserving LiDAR locomotion.
         env_cfg.scene.rgbd_camera = None
         env_cfg.scene.viz_rgb_camera = None
         env_cfg.observations.camera_obs = None
@@ -874,7 +1685,11 @@ def main():
     all_measures = ["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]
     env = VLNEnvWrapper(
                         env, policy, args_cli.task, episode,
-                        high_level_obs_key=None if args_cli.safe_replay else "camera_obs",
+                        high_level_obs_key=(
+                            None
+                            if args_cli.safe_replay or args_cli.safe_live_render
+                            else "camera_obs"
+                        ),
                         measure_names=all_measures, safe_vln=args_cli.safe_vln,
                         contact_threshold=args_cli.safe_contact_threshold,
                         orientation_limit=args_cli.safe_orientation_limit,
@@ -883,7 +1698,7 @@ def main():
                         cost_profile=safe_cost_profile,
                         calibration_file=args_cli.safe_calibration_file)
     
-    if not args_cli.safe_replay:
+    if not args_cli.safe_replay and not args_cli.safe_live_render:
         # set view pos and target
         robot_pos_w = env.unwrapped.scene["robot"].data.root_pos_w[0].detach().cpu().numpy()
         robot_quat_w = env.unwrapped.scene["robot"].data.root_quat_w[0].detach().cpu().numpy()
@@ -898,32 +1713,31 @@ def main():
 
     if args_cli.safe_replay:
         infos, rgb_obses, recorder = run_safe_replay_episode(
-            env, obs, infos, replay_episode, episode
+            env,
+            obs,
+            infos,
+            replay_episode,
+            episode,
+            replay_vlnce_metadata,
         )
         measurements = dict(infos["measurements"])
         measurements.update(recorder.summary(measurements))
         measurements.update(
-            {
-                "replay_episode_id": str(replay_episode.episode_id),
-                "physical_episode_id": str(episode["episode_id"]),
-                "observation_alignment": "offline_unpaired",
-                "navigation_metrics_aligned": False,
-                "reward_source": "graded_oracle_action",
-                "policy_tag": args_cli.safe_policy_tag,
-                "policy_version": _recorded_policy_version(recorder),
-            }
+            _replay_output_metadata(
+                replay_episode,
+                episode,
+                replay_vlnce_metadata,
+                policy_version=_recorded_policy_version(recorder),
+            )
         )
         trajectory = recorder.to_dict(measurements)
         trajectory.update(
-            {
-                "replay_episode_id": str(replay_episode.episode_id),
-                "physical_episode_id": str(episode["episode_id"]),
-                "observation_alignment": "offline_unpaired",
-                "navigation_metrics_aligned": False,
-                "reward_source": "graded_oracle_action",
-                "policy_tag": args_cli.safe_policy_tag,
-                "policy_version": _recorded_policy_version(recorder),
-            }
+            _replay_output_metadata(
+                replay_episode,
+                episode,
+                replay_vlnce_metadata,
+                policy_version=_recorded_policy_version(recorder),
+            )
         )
         replay_output_stem = (
             f"replay_{replay_episode.episode_id}_physical_"
@@ -940,6 +1754,43 @@ def main():
             rgb_obses,
             trajectory,
             output_stem=replay_output_stem,
+            video_fps=2,
+        )
+        env.close()
+        return
+    if args_cli.safe_live_render:
+        infos, rgb_obses, recorder = run_safe_live_render_episode(
+            env,
+            obs,
+            infos,
+            episode,
+            live_vlnce_metadata,
+        )
+        measurements = dict(infos["measurements"])
+        measurements.update(recorder.summary(measurements))
+        measurements.update(
+            _live_output_metadata(
+                live_vlnce_metadata,
+                policy_version=_recorded_policy_version(recorder),
+            )
+        )
+        trajectory = recorder.to_dict(measurements)
+        trajectory.update(
+            _live_output_metadata(
+                live_vlnce_metadata,
+                policy_version=_recorded_policy_version(recorder),
+            )
+        )
+        output_stem = f"live_{live_vlnce_metadata.episode_id}"
+        if args_cli.safe_policy_tag:
+            output_stem = f"{output_stem}_{args_cli.safe_policy_tag}"
+        save_evaluation_outputs(
+            env,
+            episode,
+            measurements,
+            rgb_obses,
+            trajectory,
+            output_stem=output_stem,
             video_fps=2,
         )
         env.close()

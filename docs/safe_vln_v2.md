@@ -3,7 +3,29 @@
 Safe-VLN v2 separates terminal safety events from bounded dense physical risk.
 Safe-Replay continues to read eight NaViLA frames from R2R while Isaac PhysX,
 contact sensing, robot state, and the Go2 RayCaster provide safety supervision.
-The replay objective never uses unpaired Isaac navigation progress.
+By default, the replay ID is now resolved through the original
+`R2R_VLNCE_v1-3_preprocessed/train/train.json.gz` metadata. Isaac therefore
+loads the same Matterport scene, start pose, goal, reference path, and GT
+trajectory instead of an unrelated physical episode. The replay objective
+still uses graded oracle-action reward rather than physical navigation
+progress.
+
+The default metadata paths are:
+
+```text
+~/NaVILA/evaluation/data/datasets/R2R_VLNCE_v1-3_preprocessed/train/train.json.gz
+~/NaVILA/evaluation/data/datasets/R2R_VLNCE_v1-3_preprocessed/train/train_gt.json.gz
+```
+
+They can be overridden with `--safe-replay-vlnce-metadata` and
+`--safe-replay-vlnce-gt`. `--safe-replay-legacy-unpaired` is available only
+for reproducing old datasets.
+
+`offline_reference_same_episode` means the offline RGB and live Go2 physics
+share the episode, scene, start, and goal. It does not claim strict per-step
+alignment: if the learned action differs from the oracle action, the offline
+reference video and the live robot pose can diverge. Records therefore also
+store `strict_observation_state_alignment=false`.
 
 ## Objective
 

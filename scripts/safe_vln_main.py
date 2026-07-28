@@ -14,6 +14,7 @@ import sys
 from safe_vln import train as pipeline
 from safe_vln.calibration import fit_cost_profile, read_calibration_records
 from safe_vln.objective import save_cost_profile
+from safe_vln.replay import DEFAULT_VLNCE_TRAIN_METADATA
 
 
 def add_eval_args(parser):
@@ -36,7 +37,35 @@ def add_eval_args(parser):
     parser.add_argument("--safe-replay-annotations")
     parser.add_argument("--safe-replay-id", type=int)
     parser.add_argument("--safe-replay-ids", type=int, nargs="+")
+    parser.add_argument(
+        "--safe-replay-vlnce-metadata",
+        default=str(DEFAULT_VLNCE_TRAIN_METADATA),
+    )
+    parser.add_argument("--safe-replay-vlnce-gt")
+    parser.add_argument("--safe-replay-legacy-unpaired", action="store_true")
     parser.add_argument("--safe-policy-tag")
+    parser.add_argument("--safe-live-render", action="store_true")
+    parser.add_argument("--render-host", default="127.0.0.1")
+    parser.add_argument("--render-port", type=int, default=54322)
+    parser.add_argument("--render-timeout-seconds", type=float, default=10.0)
+    parser.add_argument("--mp3d-scenes-root")
+    parser.add_argument("--vlnce-episode-id", type=int)
+    parser.add_argument("--vlnce-episode-ids", type=int, nargs="+")
+    parser.add_argument("--vlnce-metadata")
+    parser.add_argument("--vlnce-gt")
+    parser.add_argument("--dataset-role", choices=("train", "eval"), default="train")
+    parser.add_argument(
+        "--goal-stop-mode",
+        choices=("policy", "shield"),
+        default="policy",
+    )
+    parser.add_argument(
+        "--collection-policy",
+        choices=("vlm", "oracle"),
+        default="vlm",
+    )
+    parser.add_argument("--missed-stop-penalty", type=float, default=-0.5)
+    parser.add_argument("--missed-stop-patience", type=int, default=3)
     parser.add_argument("--max-vlm-calls", type=int)
     parser.add_argument("--max-episode-seconds", type=float)
     parser.add_argument("--calibration-dir")
@@ -55,6 +84,38 @@ def _python_launcher():
 
 
 def _resolve_episode_plan(args, episode_count):
+    if getattr(args, "safe_live_render", False):
+        if args.safe_replay:
+            raise ValueError(
+                "--safe-live-render cannot be combined with --safe-replay"
+            )
+        episode_ids = (
+            list(args.vlnce_episode_ids)
+            if getattr(args, "vlnce_episode_ids", None) is not None
+            else (
+                [args.vlnce_episode_id]
+                if getattr(args, "vlnce_episode_id", None) is not None
+                else []
+            )
+        )
+        if (
+            getattr(args, "vlnce_episode_id", None) is not None
+            and getattr(args, "vlnce_episode_ids", None) is not None
+        ):
+            raise ValueError(
+                "use only one of --vlnce-episode-id and --vlnce-episode-ids"
+            )
+        if not episode_ids:
+            raise ValueError(
+                "--safe-live-render requires a VLN-CE episode ID"
+            )
+        end = args.start_idx + len(episode_ids)
+        if args.end_idx is not None and args.end_idx != end:
+            raise ValueError(
+                "--end-idx must equal --start-idx plus the number of "
+                "VLN-CE episode IDs"
+            )
+        return episode_ids, end
     if args.safe_replay:
         replay_ids = (
             list(args.safe_replay_ids)
@@ -85,12 +146,58 @@ def _resolve_episode_plan(args, episode_count):
 
     if args.safe_replay_id is not None or args.safe_replay_ids is not None:
         raise ValueError("replay IDs require --safe-replay")
+    if (
+        getattr(args, "vlnce_episode_id", None) is not None
+        or getattr(args, "vlnce_episode_ids", None) is not None
+    ):
+        raise ValueError("VLN-CE episode IDs require --safe-live-render")
     end = (
         episode_count
         if args.end_idx is None
         else min(args.end_idx, episode_count)
     )
     return None, end
+
+
+def _preflight_live_assets(args, episode_ids):
+    metadata_path = Path(args.vlnce_metadata).expanduser()
+    with gzip.open(metadata_path, "rt", encoding="utf-8") as input_file:
+        payload = json.load(input_file)
+    episodes = payload.get("episodes") if isinstance(payload, dict) else None
+    if not isinstance(episodes, list):
+        raise ValueError(f"VLN-CE metadata has no episodes list: {metadata_path}")
+    by_id = {
+        str(item.get("episode_id")): item
+        for item in episodes
+        if isinstance(item, dict)
+    }
+    requested = [str(value) for value in episode_ids]
+    missing_ids = [value for value in requested if value not in by_id]
+    if missing_ids:
+        raise ValueError(
+            f"VLN-CE metadata is missing requested IDs: {missing_ids[:10]}"
+        )
+    scenes_root = Path(args.mp3d_scenes_root).expanduser()
+    missing_assets = []
+    for scene_id in sorted(
+        {
+            os.path.splitext(
+                os.path.basename(str(by_id[value]["scene_id"]))
+            )[0]
+            for value in requested
+        }
+    ):
+        scene_root = scenes_root / scene_id
+        for suffix in (".glb", ".navmesh"):
+            path = scene_root / f"{scene_id}{suffix}"
+            if not path.is_file():
+                missing_assets.append(str(path))
+    if missing_assets:
+        preview = "\n".join(missing_assets[:10])
+        raise RuntimeError(
+            f"selected live-render episodes need {len(missing_assets)} missing "
+            f"MP3D assets:\n{preview}"
+        )
 
 
 def run_episodes(args):
@@ -102,6 +209,10 @@ def run_episodes(args):
         raise ValueError("--max-vlm-calls must be positive")
     if args.max_episode_seconds is not None and args.max_episode_seconds <= 0:
         raise ValueError("--max-episode-seconds must be positive")
+    if args.render_timeout_seconds <= 0:
+        raise ValueError("--render-timeout-seconds must be positive")
+    if args.missed_stop_patience <= 0:
+        raise ValueError("--missed-stop-patience must be positive")
     with gzip.open(args.r2r_data_path, "rt", encoding="utf-8") as file:
         episodes = json.load(file)["episodes"]
     replay_ids, end = _resolve_episode_plan(args, len(episodes))
@@ -110,6 +221,26 @@ def run_episodes(args):
             raise ValueError(
                 "--safe-replay requires --safe-replay-root"
             )
+    if args.safe_live_render:
+        if not args.vlnce_metadata or not args.mp3d_scenes_root:
+            raise ValueError(
+                "--safe-live-render requires --vlnce-metadata and "
+                "--mp3d-scenes-root"
+            )
+        metadata_split = Path(args.vlnce_metadata).expanduser().parent.name
+        if metadata_split == "val_unseen" and args.dataset_role != "eval":
+            raise ValueError(
+                "val_unseen live-render data requires --dataset-role=eval"
+            )
+        if args.collection_policy == "oracle" and args.dataset_role != "train":
+            raise ValueError(
+                "--collection-policy=oracle is allowed only for train data"
+            )
+        if args.collection_policy == "oracle" and args.goal_stop_mode == "shield":
+            raise ValueError(
+                "--collection-policy=oracle cannot be combined with shield mode"
+            )
+        _preflight_live_assets(args, replay_ids)
     if not 0 <= args.start_idx < end:
         raise ValueError("invalid episode range")
 
@@ -128,6 +259,10 @@ def run_episodes(args):
             "--safe-vln",
             f"--safe-blocked-seconds={args.blocked_seconds}",
             f"--safe-blocked-distance={args.blocked_distance}",
+            f"--goal-stop-mode={args.goal_stop_mode}",
+            f"--collection-policy={args.collection_policy}",
+            f"--missed-stop-penalty={args.missed_stop_penalty}",
+            f"--missed-stop-patience={args.missed_stop_patience}",
         ]
         if args.cost_limit is not None:
             command.append(f"--safe-cost-limit={args.cost_limit}")
@@ -158,6 +293,38 @@ def run_episodes(args):
                 command.append(
                     f"--safe-replay-annotations={args.safe_replay_annotations}"
                 )
+            if args.safe_replay_vlnce_metadata:
+                command.append(
+                    "--safe-replay-vlnce-metadata="
+                    f"{args.safe_replay_vlnce_metadata}"
+                )
+            if args.safe_replay_vlnce_gt:
+                command.append(
+                    f"--safe-replay-vlnce-gt={args.safe_replay_vlnce_gt}"
+                )
+            if args.safe_replay_legacy_unpaired:
+                command.append("--safe-replay-legacy-unpaired")
+            if args.safe_policy_tag:
+                command.append(f"--safe-policy-tag={args.safe_policy_tag}")
+        elif args.safe_live_render:
+            vlnce_id = replay_ids[index - args.start_idx]
+            command.extend(
+                [
+                    "--safe-live-render",
+                    f"--vlnce-episode-id={vlnce_id}",
+                    f"--vlnce-metadata={args.vlnce_metadata}",
+                    f"--mp3d-scenes-root={args.mp3d_scenes_root}",
+                    f"--render-host={args.render_host}",
+                    f"--render-port={args.render_port}",
+                    (
+                        "--render-timeout-seconds="
+                        f"{args.render_timeout_seconds}"
+                    ),
+                    f"--dataset-role={args.dataset_role}",
+                ]
+            )
+            if args.vlnce_gt:
+                command.append(f"--vlnce-gt={args.vlnce_gt}")
             if args.safe_policy_tag:
                 command.append(f"--safe-policy-tag={args.safe_policy_tag}")
         else:
@@ -192,6 +359,16 @@ def summarize(args):
         return sum(float(row.get(key, 0.0) or 0.0) for row in rows) / len(rows)
 
     costs = sorted(float(row.get("cumulative_cost", 0.0)) for row in rows)
+    stop_recalls = [
+        float(row["stop_recall_in_goal"])
+        for row in rows
+        if row.get("stop_recall_in_goal") is not None
+    ]
+    minimum_distances = [
+        float(row["minimum_distance_to_goal_m"])
+        for row in rows
+        if row.get("minimum_distance_to_goal_m") is not None
+    ]
 
     def percentile(value):
         return costs[round((len(costs) - 1) * value)]
@@ -219,6 +396,30 @@ def summarize(args):
         "cost_p95": percentile(0.95),
         "cost_p99": percentile(0.99),
         "cost_max": costs[-1],
+        "policy_success_rate": mean("policy_success"),
+        "system_success_rate": mean("system_success"),
+        "policy_system_success_gap": (
+            mean("system_success") - mean("policy_success")
+        ),
+        "entered_goal_rate": mean("entered_goal_radius"),
+        "mean_goal_dwell_decisions": mean("goal_dwell_decisions"),
+        "mean_oracle_stop_decisions": mean("oracle_stop_decisions"),
+        "mean_model_stop_decisions": mean("model_stop_decisions"),
+        "mean_missed_stop_count": mean("missed_stop_count"),
+        "stop_recall_in_goal": (
+            sum(stop_recalls) / len(stop_recalls) if stop_recalls else None
+        ),
+        "mean_minimum_distance_to_goal_m": (
+            sum(minimum_distances) / len(minimum_distances)
+            if minimum_distances
+            else None
+        ),
+        "shield_intervention_rate": sum(
+            float(row.get("shield_intervention_count", 0.0) or 0.0) > 0
+            for row in rows
+        )
+        / len(rows),
+        "goal_escape_rate": mean("goal_escape_after_entry"),
     }
     output = Path(args.output or Path(args.measurement_dir).parent / "safe_vln_summary.json")
     output.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -250,8 +451,10 @@ def add_model_args(parser, *, train=False):
         parser.add_argument("--gamma", type=float, default=0.99)
         parser.add_argument("--gae-lambda", type=float, default=0.95)
         parser.add_argument("--lagrange-lr", type=float, default=0.035)
-        parser.add_argument("--initial-lagrange-multiplier", type=float, default=0.001)
+        parser.add_argument("--initial-lagrange-multiplier", type=float)
         parser.add_argument("--policy-version", type=int, default=0)
+        parser.add_argument("--oracle-ce-coef", type=float, default=0.05)
+        parser.add_argument("--oracle-stop-weight", type=float, default=5.0)
     else:
         parser.add_argument("--dataset-dir", required=True)
         parser.add_argument("--epochs", type=int, default=1)
@@ -270,6 +473,22 @@ def parse_args():
     calibrate.add_argument("--output-profile", required=True)
     warmup = subparsers.add_parser("warmup-critics")
     add_model_args(warmup)
+    actor_warmup = subparsers.add_parser("warmup-actor")
+    actor_warmup.add_argument("--model-path", required=True)
+    actor_warmup.add_argument("--dataset-dir", required=True)
+    actor_warmup.add_argument("--output-dir", required=True)
+    actor_warmup.add_argument("--device", default="cuda")
+    actor_warmup.add_argument(
+        "--training-dtype",
+        choices=("bfloat16", "float16"),
+        default="bfloat16",
+    )
+    actor_warmup.add_argument("--split", default="train")
+    actor_warmup.add_argument("--actor-lr", type=float, default=1e-6)
+    actor_warmup.add_argument("--epochs", type=int, default=1)
+    actor_warmup.add_argument("--mini-batch-size", type=int, default=1)
+    actor_warmup.add_argument("--max-samples", type=int)
+    actor_warmup.add_argument("--oracle-stop-weight", type=float, default=5.0)
     train = subparsers.add_parser("train")
     add_model_args(train, train=True)
     summary = subparsers.add_parser("summarize")
@@ -287,12 +506,20 @@ def main():
     if args.command == "evaluate":
         return run_episodes(args)
     if args.command == "calibrate-safety":
-        if not args.safe_replay or args.safe_replay_ids is None:
+        calibration_ids = (
+            args.safe_replay_ids
+            if args.safe_replay
+            else args.vlnce_episode_ids
+            if args.safe_live_render
+            else None
+        )
+        if calibration_ids is None:
             raise ValueError(
-                "calibrate-safety requires --safe-replay and --safe-replay-ids"
+                "calibrate-safety requires either --safe-replay-ids or "
+                "--safe-live-render with --vlnce-episode-ids"
             )
-        if len(args.safe_replay_ids) != 80:
-            raise ValueError("calibrate-safety requires exactly 80 replay episodes")
+        if len(calibration_ids) != 80:
+            raise ValueError("calibrate-safety requires exactly 80 episodes")
         if not args.calibration_dir:
             raise ValueError("calibrate-safety requires --calibration-dir")
         calibration_dir = Path(args.calibration_dir).expanduser()
@@ -319,6 +546,8 @@ def main():
         return 0
     if args.command == "warmup-critics":
         return pipeline.warmup(args)
+    if args.command == "warmup-actor":
+        return pipeline.warmup_actor(args)
     if args.command == "train":
         return pipeline.train(args)
     return summarize(args)

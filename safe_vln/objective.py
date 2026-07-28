@@ -12,7 +12,8 @@ from typing import Any, Mapping
 from .actions import ACTIONS
 
 
-SCHEMA_VERSION = "safe-vln-go2-v2"
+SCHEMA_VERSION = "safe-vln-go2-v3"
+LEGACY_OBJECTIVE_SCHEMA_VERSIONS = frozenset({"safe-vln-go2-v2"})
 COST_PROFILE_VERSION = "safe-vln-go2-cost-profile-v1"
 
 REPLAY_REWARD_CONFIG = {
@@ -32,6 +33,8 @@ ONLINE_REWARD_CONFIG = {
     "macro_step_penalty": -0.01,
     "success_reward": 10.0,
     "failed_stop_penalty": -1.0,
+    "missed_stop_penalty": -0.5,
+    "missed_stop_patience": 3,
     "subtract_safety_cost": False,
 }
 
@@ -232,7 +235,10 @@ def build_objective_config(cost_profile: Mapping[str, Any]) -> dict[str, Any]:
 
 def validate_objective_config(config: Mapping[str, Any]) -> dict[str, Any]:
     result = deepcopy(dict(config))
-    if result.get("schema_version") != SCHEMA_VERSION:
+    if result.get("schema_version") not in {
+        SCHEMA_VERSION,
+        *LEGACY_OBJECTIVE_SCHEMA_VERSIONS,
+    }:
         raise ValueError(
             f"unsupported Safe-VLN objective schema: "
             f"{result.get('schema_version')!r}"
@@ -297,6 +303,7 @@ assert len(ACTIONS) == 10
 __all__ = [
     "COST_PROFILE_VERSION",
     "DEFAULT_COST_PROFILE",
+    "LEGACY_OBJECTIVE_SCHEMA_VERSIONS",
     "ONLINE_REWARD_CONFIG",
     "REPLAY_REWARD_CONFIG",
     "SCHEMA_VERSION",

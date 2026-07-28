@@ -15,11 +15,17 @@ from .trainer import SafePPOOptimizer
 def train_critic_epoch(model, samples, preprocessor, optimizer, *, max_samples: int | None = None):
     model.train()
     total_loss = 0.0
+    reward_count = 0
+    cost_count = 0
     count = 0
     for frames, metadata in samples:
         if max_samples is not None and count >= max_samples:
             break
         if "reward_return" not in metadata or "cost_return" not in metadata:
+            continue
+        reward_eligible = bool(metadata.get("reward_critic_eligible", True))
+        cost_eligible = bool(metadata.get("cost_critic_eligible", True))
+        if not reward_eligible and not cost_eligible:
             continue
         state = preprocessor(frames, metadata["instruction"])
         output = model(state.input_ids, images=state.images)
@@ -27,7 +33,10 @@ def train_critic_epoch(model, samples, preprocessor, optimizer, *, max_samples: 
         cost_target = torch.tensor([metadata["cost_return"]], device=output.cost_values.device)
         reward_loss = 0.5 * (output.reward_values - reward_target).square().mean()
         cost_loss = 0.5 * (output.cost_values - cost_target).square().mean()
-        loss = reward_loss + cost_loss
+        loss = (
+            reward_loss * float(reward_eligible)
+            + cost_loss * float(cost_eligible)
+        )
         if not torch.isfinite(loss):
             raise FloatingPointError("critic warm-start loss is not finite")
         optimizer.zero_grad(set_to_none=True)
@@ -37,8 +46,15 @@ def train_critic_epoch(model, samples, preprocessor, optimizer, *, max_samples: 
         )
         optimizer.step()
         total_loss += float(loss.detach().item())
+        reward_count += int(reward_eligible)
+        cost_count += int(cost_eligible)
         count += 1
-    return {"critic/loss": total_loss / max(count, 1), "critic/samples": count}
+    return {
+        "critic/loss": total_loss / max(count, 1),
+        "critic/samples": count,
+        "critic/reward_samples": reward_count,
+        "critic/cost_samples": cost_count,
+    }
 
 
 def evaluate_selected_actions(model, prepared_states, action_ids: torch.Tensor):
@@ -53,6 +69,7 @@ def evaluate_selected_actions(model, prepared_states, action_ids: torch.Tensor):
     logits = torch.cat(logits)
     distribution = torch.distributions.Categorical(logits=logits)
     return {
+        "action_logits": logits,
         "new_log_probs": distribution.log_prob(action_ids.to(logits.device)),
         "reward_values": torch.cat(reward_values),
         "cost_values": torch.cat(cost_values),

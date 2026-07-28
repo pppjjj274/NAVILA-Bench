@@ -9,7 +9,9 @@ data can be checked before the simulator is started.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import gzip
 import json
+import math
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -19,10 +21,200 @@ from .actions import NAVILA_ACTION_RESPONSES, SafeAction, action_from_id
 
 
 _NUM_REPLAY_FRAMES = 8
+DEFAULT_VLNCE_TRAIN_METADATA = Path(
+    "~/NaVILA/evaluation/data/datasets/"
+    "R2R_VLNCE_v1-3_preprocessed/train/train.json.gz"
+)
 _OFFICIAL_ORACLE_ACTION_IDS = {
     text.lower(): action_id
     for action_id, text in enumerate(NAVILA_ACTION_RESPONSES)
 }
+
+
+def habitat_position_to_isaac(
+    position: Sequence[float],
+) -> tuple[float, float, float]:
+    """Convert Habitat's ``(x, y-up, z)`` coordinates to Isaac ``(x, y, z-up)``."""
+    if len(position) != 3:
+        raise ValueError(f"expected a 3D Habitat position, got {position!r}")
+    x, y, z = (float(value) for value in position)
+    if not all(math.isfinite(value) for value in (x, y, z)):
+        raise ValueError(f"Habitat position must be finite, got {position!r}")
+    return (x, -z, y)
+
+
+def habitat_heading_to_isaac(
+    rotation_xyzw: Sequence[float],
+) -> tuple[float, float, float, float]:
+    """Convert an R2R Habitat heading quaternion to Isaac's WXYZ convention.
+
+    R2R episode rotations are yaw-only quaternions in Habitat's XYZW,
+    Y-up coordinate frame.  The Matterport USD conversion maps Habitat
+    ``(x, y, z)`` to Isaac ``(x, -z, y)``, which adds 90 degrees to the
+    planar heading.
+    """
+    if len(rotation_xyzw) != 4:
+        raise ValueError(
+            f"expected a 4D Habitat XYZW quaternion, got {rotation_xyzw!r}"
+        )
+    x, y, z, w = (float(value) for value in rotation_xyzw)
+    if not all(math.isfinite(value) for value in (x, y, z, w)):
+        raise ValueError(
+            f"Habitat rotation must be finite, got {rotation_xyzw!r}"
+        )
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm <= 0:
+        raise ValueError("Habitat rotation quaternion has zero norm")
+    x, y, z, w = (value / norm for value in (x, y, z, w))
+    if abs(x) > 1e-5 or abs(z) > 1e-5:
+        raise ValueError(
+            "R2R start_rotation must be a yaw-only Habitat quaternion"
+        )
+    habitat_yaw = 2.0 * math.atan2(y, w)
+    isaac_yaw = habitat_yaw + math.pi / 2.0
+    return (
+        math.cos(isaac_yaw / 2.0),
+        0.0,
+        0.0,
+        math.sin(isaac_yaw / 2.0),
+    )
+
+
+def _raw_position_tuple(
+    value: Any, *, field_name: str
+) -> tuple[float, float, float]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{field_name} must be a 3D position")
+    try:
+        position = tuple(float(component) for component in value)
+        habitat_position_to_isaac(position)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid {field_name}: {value!r}") from error
+    return position
+
+
+@dataclass(frozen=True)
+class VLNCEEpisodeMetadata:
+    """Original VLN-CE metadata and oracle trajectory for one R2R episode."""
+
+    episode_id: str
+    trajectory_id: int | str | None
+    scene_id: str
+    instruction: str
+    instruction_tokens: tuple[int, ...]
+    start_position_habitat: tuple[float, float, float]
+    start_rotation_habitat_xyzw: tuple[float, float, float, float]
+    goal_position_habitat: tuple[float, float, float]
+    goal_radius: float
+    reference_path_habitat: tuple[tuple[float, float, float], ...]
+    geodesic_distance: float | None
+    gt_actions: tuple[int, ...]
+    gt_locations_habitat: tuple[tuple[float, float, float], ...]
+    gt_forward_steps: int
+    metadata_path: Path
+    gt_path: Path
+
+    @property
+    def scene_name(self) -> str:
+        return Path(self.scene_id).stem
+
+    @property
+    def start_position_isaac(self) -> tuple[float, float, float]:
+        return habitat_position_to_isaac(self.start_position_habitat)
+
+    @property
+    def start_rotation_isaac_wxyz(self) -> tuple[float, float, float, float]:
+        return habitat_heading_to_isaac(self.start_rotation_habitat_xyzw)
+
+    @property
+    def goal_position_isaac(self) -> tuple[float, float, float]:
+        return habitat_position_to_isaac(self.goal_position_habitat)
+
+    @property
+    def reference_path_isaac(self) -> tuple[tuple[float, float, float], ...]:
+        return tuple(
+            habitat_position_to_isaac(position)
+            for position in self.reference_path_habitat
+        )
+
+    @property
+    def gt_locations_isaac(self) -> tuple[tuple[float, float, float], ...]:
+        return tuple(
+            habitat_position_to_isaac(position)
+            for position in self.gt_locations_habitat
+        )
+
+    def to_isaac_episode(self) -> dict[str, Any]:
+        """Return the episode schema consumed by NaVILA-Bench's Isaac wrapper."""
+        episode_id: int | str = (
+            int(self.episode_id)
+            if self.episode_id.isdecimal()
+            else self.episode_id
+        )
+        info: dict[str, float] = {}
+        if self.geodesic_distance is not None:
+            info["geodesic_distance"] = self.geodesic_distance
+        return {
+            "episode_id": episode_id,
+            "trajectory_id": self.trajectory_id,
+            "scene_id": self.scene_id,
+            "start_position": list(self.start_position_isaac),
+            "start_rotation": list(self.start_rotation_isaac_wxyz),
+            "info": info,
+            "goals": [
+                {
+                    "position": list(self.goal_position_isaac),
+                    "radius": self.goal_radius,
+                }
+            ],
+            "instruction": {
+                "instruction_text": self.instruction,
+                "instruction_tokens": list(self.instruction_tokens),
+            },
+            "reference_path": [
+                list(position) for position in self.reference_path_isaac
+            ],
+            "gt_actions": list(self.gt_actions),
+            "gt_locations": [
+                list(position) for position in self.gt_locations_isaac
+            ],
+            "gt_forward_steps": self.gt_forward_steps,
+        }
+
+    def alignment_record(self) -> dict[str, Any]:
+        """Serializable provenance stored once per Safe-Replay episode."""
+        return {
+            "vlnce_episode_id": self.episode_id,
+            "vlnce_trajectory_id": self.trajectory_id,
+            "vlnce_scene_id": self.scene_id,
+            "vlnce_metadata_path": str(self.metadata_path),
+            "vlnce_gt_path": str(self.gt_path),
+            "start_position_habitat": list(self.start_position_habitat),
+            "start_rotation_habitat_xyzw": list(
+                self.start_rotation_habitat_xyzw
+            ),
+            "start_position_isaac": list(self.start_position_isaac),
+            "start_rotation_isaac_wxyz": list(
+                self.start_rotation_isaac_wxyz
+            ),
+            "goal_position_habitat": list(self.goal_position_habitat),
+            "goal_position_isaac": list(self.goal_position_isaac),
+            "goal_radius": self.goal_radius,
+            "reference_path_habitat": [
+                list(position) for position in self.reference_path_habitat
+            ],
+            "reference_path_isaac": [
+                list(position) for position in self.reference_path_isaac
+            ],
+            "gt_actions": list(self.gt_actions),
+            "gt_locations_habitat": [
+                list(position) for position in self.gt_locations_habitat
+            ],
+            "gt_locations_isaac": [
+                list(position) for position in self.gt_locations_isaac
+            ],
+            "gt_forward_steps": self.gt_forward_steps,
+        }
 
 
 def _parse_official_oracle_action(raw_action: str, *, video_id: str) -> SafeAction:
@@ -163,6 +355,162 @@ def _read_annotations(path: Path) -> list[Mapping[str, Any]]:
     return payload
 
 
+def _read_gzip_json(path: Path, *, description: str) -> Any:
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as input_file:
+            return json.load(input_file)
+    except (FileNotFoundError, OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Unable to read {description}: {path}") from error
+
+
+def _default_gt_path(metadata_path: Path) -> Path:
+    name = metadata_path.name
+    suffix = ".json.gz"
+    if not name.endswith(suffix):
+        raise ValueError(
+            "VLN-CE metadata filename must end in .json.gz when the GT path "
+            "is not specified"
+        )
+    return metadata_path.with_name(f"{name[:-len(suffix)]}_gt{suffix}")
+
+
+def load_vlnce_episode_metadata(
+    metadata_path: str | Path,
+    episode_id: str | int,
+    *,
+    gt_path: str | Path | None = None,
+) -> VLNCEEpisodeMetadata:
+    """Load and convert an original VLN-CE episode plus its oracle trajectory."""
+    resolved_metadata_path = Path(metadata_path).expanduser().resolve()
+    resolved_gt_path = (
+        Path(gt_path).expanduser().resolve()
+        if gt_path is not None
+        else _default_gt_path(resolved_metadata_path)
+    )
+    requested_id = str(episode_id)
+
+    payload = _read_gzip_json(
+        resolved_metadata_path, description="VLN-CE episode metadata"
+    )
+    episodes = payload.get("episodes") if isinstance(payload, Mapping) else None
+    if not isinstance(episodes, list):
+        raise ValueError(
+            f"VLN-CE metadata has no episodes list: {resolved_metadata_path}"
+        )
+    matches = [
+        episode
+        for episode in episodes
+        if isinstance(episode, Mapping)
+        and str(episode.get("episode_id")) == requested_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"VLN-CE episode {requested_id!r} was found {len(matches)} times "
+            f"in {resolved_metadata_path}"
+        )
+    episode = matches[0]
+
+    gt_payload = _read_gzip_json(
+        resolved_gt_path, description="VLN-CE ground-truth trajectories"
+    )
+    if not isinstance(gt_payload, Mapping) or requested_id not in gt_payload:
+        raise ValueError(
+            f"VLN-CE GT episode {requested_id!r} was not found in "
+            f"{resolved_gt_path}"
+        )
+    gt = gt_payload[requested_id]
+    if not isinstance(gt, Mapping):
+        raise ValueError(f"VLN-CE GT episode {requested_id!r} must be an object")
+
+    instruction_payload = episode.get("instruction")
+    if not isinstance(instruction_payload, Mapping):
+        raise ValueError(f"VLN-CE episode {requested_id!r} has no instruction")
+    instruction = instruction_payload.get("instruction_text")
+    if not isinstance(instruction, str) or not instruction.strip():
+        raise ValueError(
+            f"VLN-CE episode {requested_id!r} has invalid instruction text"
+        )
+    raw_tokens = instruction_payload.get("instruction_tokens", [])
+    if not isinstance(raw_tokens, list):
+        raise ValueError(
+            f"VLN-CE episode {requested_id!r} has invalid instruction tokens"
+        )
+
+    goals = episode.get("goals")
+    if not isinstance(goals, list) or len(goals) != 1:
+        raise ValueError(
+            f"VLN-CE episode {requested_id!r} must contain exactly one goal"
+        )
+    goal = goals[0]
+    if not isinstance(goal, Mapping):
+        raise ValueError(f"VLN-CE episode {requested_id!r} goal must be an object")
+
+    raw_reference_path = episode.get("reference_path")
+    raw_gt_locations = gt.get("locations")
+    raw_gt_actions = gt.get("actions")
+    if not isinstance(raw_reference_path, list) or not raw_reference_path:
+        raise ValueError(
+            f"VLN-CE episode {requested_id!r} has no reference path"
+        )
+    if not isinstance(raw_gt_locations, list) or not raw_gt_locations:
+        raise ValueError(f"VLN-CE episode {requested_id!r} has no GT locations")
+    if not isinstance(raw_gt_actions, list) or not raw_gt_actions:
+        raise ValueError(f"VLN-CE episode {requested_id!r} has no GT actions")
+
+    scene_id = episode.get("scene_id")
+    if not isinstance(scene_id, str) or not scene_id:
+        raise ValueError(f"VLN-CE episode {requested_id!r} has no scene_id")
+    raw_rotation = episode.get("start_rotation")
+    if not isinstance(raw_rotation, Sequence) or isinstance(
+        raw_rotation, (str, bytes)
+    ):
+        raise ValueError(
+            f"VLN-CE episode {requested_id!r} has invalid start_rotation"
+        )
+    rotation = tuple(float(value) for value in raw_rotation)
+    habitat_heading_to_isaac(rotation)
+
+    raw_info = episode.get("info", {})
+    geodesic_distance = (
+        float(raw_info["geodesic_distance"])
+        if isinstance(raw_info, Mapping)
+        and raw_info.get("geodesic_distance") is not None
+        else None
+    )
+    return VLNCEEpisodeMetadata(
+        episode_id=requested_id,
+        trajectory_id=episode.get("trajectory_id"),
+        scene_id=scene_id,
+        instruction=instruction,
+        instruction_tokens=tuple(int(token) for token in raw_tokens),
+        start_position_habitat=_raw_position_tuple(
+            episode.get("start_position"), field_name="start_position"
+        ),
+        start_rotation_habitat_xyzw=rotation,
+        goal_position_habitat=_raw_position_tuple(
+            goal.get("position"), field_name="goal position"
+        ),
+        goal_radius=float(goal.get("radius", 3.0)),
+        reference_path_habitat=tuple(
+            _raw_position_tuple(
+                position, field_name=f"reference_path[{index}]"
+            )
+            for index, position in enumerate(raw_reference_path)
+        ),
+        geodesic_distance=geodesic_distance,
+        gt_actions=tuple(int(action) for action in raw_gt_actions),
+        gt_locations_habitat=tuple(
+            _raw_position_tuple(
+                position, field_name=f"GT locations[{index}]"
+            )
+            for index, position in enumerate(raw_gt_locations)
+        ),
+        gt_forward_steps=int(gt.get("forward_steps", 0)),
+        metadata_path=resolved_metadata_path,
+        gt_path=resolved_gt_path,
+    )
+
+
 def _resolve_frame_path(train_root: Path, value: Any, *, video_id: str) -> Path:
     if not isinstance(value, str) or not value:
         raise ValueError(f"R2R annotation {video_id!r} contains an invalid frame path: {value!r}")
@@ -272,7 +620,12 @@ def load_r2r_replay_episode(
 
 
 __all__ = [
+    "DEFAULT_VLNCE_TRAIN_METADATA",
     "R2RReplayEpisode",
     "R2RReplayStep",
+    "VLNCEEpisodeMetadata",
+    "habitat_heading_to_isaac",
+    "habitat_position_to_isaac",
     "load_r2r_replay_episode",
+    "load_vlnce_episode_metadata",
 ]

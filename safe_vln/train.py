@@ -4,16 +4,26 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+import math
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from .cmdp import LagrangeController, compute_gae
 from .dataset import iter_samples
 from .learner import evaluate_selected_actions, save_checkpoint, train_critic_epoch
+from .live_render import LEGACY_LIVE_SCHEMA_VERSIONS, LIVE_SCHEMA_VERSION
 from .navila import load_safe_navila
 from .objective import validate_objective_config
 from .trainer import PPOConfig, SafePPOOptimizer, normalize_advantage
+
+
+VERSIONED_DATASET_SCHEMAS = {
+    "safe-vln-go2-v2",
+    *LEGACY_LIVE_SCHEMA_VERSIONS,
+    LIVE_SCHEMA_VERSION,
+}
 
 
 def _read_json(path):
@@ -41,26 +51,26 @@ def _validate_objective_compatibility(manifest, checkpoint_state):
     schema = manifest.get("schema_version")
     dataset_fingerprint = manifest.get("objective_fingerprint")
     checkpoint_fingerprint = checkpoint_state.get("objective_fingerprint")
-    if schema == "safe-vln-go2-v2":
+    if schema in VERSIONED_DATASET_SCHEMAS:
         if not dataset_fingerprint:
-            raise RuntimeError("v2 rollout manifest has no objective fingerprint")
+            raise RuntimeError("versioned rollout manifest has no objective fingerprint")
         objective_config = manifest.get("objective_config")
         if not objective_config:
-            raise RuntimeError("v2 rollout manifest has no objective configuration")
+            raise RuntimeError("versioned rollout manifest has no objective configuration")
         try:
             validated_objective = validate_objective_config(objective_config)
         except (KeyError, TypeError, ValueError) as error:
-            raise RuntimeError("v2 rollout objective configuration is invalid") from error
+            raise RuntimeError("versioned rollout objective configuration is invalid") from error
         if validated_objective["fingerprint"] != dataset_fingerprint:
             raise RuntimeError(
-                "v2 rollout manifest fingerprint does not match its objective"
+                "versioned rollout manifest fingerprint does not match its objective"
             )
         if checkpoint_fingerprint != dataset_fingerprint:
             raise RuntimeError(
                 "checkpoint and rollout objective fingerprints do not match"
             )
     elif dataset_fingerprint or checkpoint_fingerprint:
-        raise RuntimeError("legacy v1 data cannot be mixed with a v2 objective")
+        raise RuntimeError("legacy v1 data cannot be mixed with a versioned objective")
     return schema, dataset_fingerprint
 
 
@@ -85,24 +95,182 @@ def _optimizer(model, actor_lr, critic_lr):
     return torch.optim.AdamW(groups)
 
 
+def _enable_gradient_checkpointing(model):
+    if hasattr(model.base_model, "gradient_checkpointing_enable"):
+        try:
+            model.base_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.base_model.gradient_checkpointing_enable()
+
+
+def _initial_lagrange_multiplier(args, checkpoint_state):
+    explicit = getattr(args, "initial_lagrange_multiplier", None)
+    value = (
+        explicit
+        if explicit is not None
+        else checkpoint_state.get("lagrange_multiplier", 0.001)
+    )
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("initial Lagrange multiplier must be finite and non-negative")
+    return value
+
+
+def warmup_actor(args):
+    """Fresh-LoRA behavior cloning on strictly aligned dynamic-oracle samples."""
+    if getattr(args, "checkpoint", None):
+        raise ValueError("warmup-actor starts from fresh NaViLA LoRA; omit --checkpoint")
+    if args.actor_lr <= 0:
+        raise ValueError("--actor-lr must be positive")
+    if args.oracle_stop_weight <= 0:
+        raise ValueError("--oracle-stop-weight must be positive")
+    if args.mini_batch_size <= 0:
+        raise ValueError("--mini-batch-size must be positive")
+    manifest = _dataset_manifest(args.dataset_dir)
+    if manifest.get("dataset_role") != "train":
+        raise RuntimeError("actor warmup requires a training dataset")
+    if manifest.get("schema_version") != LIVE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"actor warmup requires {LIVE_SCHEMA_VERSION} strict live-render data"
+        )
+    objective_fingerprint = manifest.get("objective_fingerprint")
+    if not objective_fingerprint:
+        raise RuntimeError("actor warmup dataset has no objective fingerprint")
+
+    model, preprocessor = load_safe_navila(
+        args.model_path,
+        device=args.device,
+        dtype=_training_dtype(args),
+        checkpoint=None,
+    )
+    model.train()
+    model.reward_head.requires_grad_(False)
+    model.cost_head.requires_grad_(False)
+    _enable_gradient_checkpointing(model)
+    actor_parameters = [
+        parameter
+        for parameter in model.base_model.parameters()
+        if parameter.requires_grad
+    ]
+    if not actor_parameters:
+        raise RuntimeError("fresh NaViLA model has no trainable LoRA parameters")
+    optimizer = torch.optim.AdamW(actor_parameters, lr=args.actor_lr)
+
+    samples = []
+    for frames, metadata in iter_samples(args.dataset_dir, args.split):
+        if metadata.get("schema_version") != LIVE_SCHEMA_VERSION:
+            raise RuntimeError("actor warmup sample schema does not match manifest")
+        if metadata.get("objective_fingerprint") != objective_fingerprint:
+            raise RuntimeError(
+                "actor warmup sample objective fingerprint does not match manifest"
+            )
+        if not bool(metadata.get("oracle_eligible", False)):
+            continue
+        oracle_action_id = metadata.get("oracle_action_id")
+        if oracle_action_id is None:
+            continue
+        samples.append((frames, metadata))
+        if args.max_samples is not None and len(samples) >= args.max_samples:
+            break
+    if not samples:
+        raise RuntimeError("actor warmup found no oracle-eligible samples")
+
+    state = {
+        "mode": "warmup-actor",
+        "training_dtype": getattr(args, "training_dtype", "bfloat16"),
+        "schema_version": LIVE_SCHEMA_VERSION,
+        "objective_fingerprint": objective_fingerprint,
+        "objective_config": manifest.get("objective_config"),
+        "policy_version": 0,
+        "fresh_lora": True,
+        "oracle_stop_weight": float(args.oracle_stop_weight),
+    }
+    update = 0
+    for epoch in range(args.epochs):
+        epoch_loss = 0.0
+        epoch_batches = 0
+        epoch_correct = 0
+        epoch_stop_correct = 0
+        epoch_stop_samples = 0
+        for start in range(0, len(samples), args.mini_batch_size):
+            mini_batch = samples[start : start + args.mini_batch_size]
+            weights = [
+                float(args.oracle_stop_weight)
+                if int(metadata["oracle_action_id"]) == 9
+                else 1.0
+                for _, metadata in mini_batch
+            ]
+            weight_sum = sum(weights)
+            optimizer.zero_grad(set_to_none=True)
+            batch_loss = 0.0
+            for (frames, metadata), weight in zip(mini_batch, weights):
+                prepared = preprocessor(frames, metadata["instruction"])
+                output = model(prepared.input_ids, images=prepared.images)
+                target = torch.tensor(
+                    [int(metadata["oracle_action_id"])],
+                    dtype=torch.long,
+                    device=output.action_logits.device,
+                )
+                loss = F.cross_entropy(output.action_logits, target)
+                (loss * (weight / weight_sum)).backward()
+                batch_loss += float(loss.detach().item()) * weight / weight_sum
+                prediction = int(output.action_logits.detach().argmax(dim=-1).item())
+                target_id = int(target.item())
+                epoch_correct += int(prediction == target_id)
+                if target_id == 9:
+                    epoch_stop_samples += 1
+                    epoch_stop_correct += int(prediction == 9)
+            grad_norm = torch.nn.utils.clip_grad_norm_(actor_parameters, 0.5)
+            if not torch.isfinite(grad_norm):
+                raise FloatingPointError("actor warmup gradient norm is not finite")
+            optimizer.step()
+            update += 1
+            epoch_batches += 1
+            epoch_loss += batch_loss
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        state.update(
+            {
+                "epoch": epoch + 1,
+                "updates": update,
+                "actor/loss": epoch_loss / max(epoch_batches, 1),
+                "actor/samples": len(samples),
+                "actor/accuracy": epoch_correct / len(samples),
+                "actor/stop_samples": epoch_stop_samples,
+                "actor/stop_accuracy": (
+                    epoch_stop_correct / epoch_stop_samples
+                    if epoch_stop_samples
+                    else None
+                ),
+            }
+        )
+        print(json.dumps(state), flush=True)
+    save_checkpoint(model, optimizer, args.output_dir, state)
+    return 0
+
+
 def warmup(args):
     if getattr(args, "reset_critics", False) and not args.checkpoint:
         raise ValueError("--reset-critics requires --checkpoint")
     manifest = _dataset_manifest(args.dataset_dir)
+    if manifest.get("dataset_role") == "eval":
+        raise RuntimeError("evaluation datasets cannot be used for critic warmup")
     checkpoint_state = _checkpoint_state(args.checkpoint)
     schema = manifest.get("schema_version")
     objective_fingerprint = manifest.get("objective_fingerprint")
-    if schema == "safe-vln-go2-v2" and not objective_fingerprint:
-        raise RuntimeError("v2 warmup dataset has no objective fingerprint")
+    if schema in VERSIONED_DATASET_SCHEMAS and not objective_fingerprint:
+        raise RuntimeError("versioned warmup dataset has no objective fingerprint")
     if (
-        schema == "safe-vln-go2-v2"
+        schema in VERSIONED_DATASET_SCHEMAS
         and args.checkpoint
         and not getattr(args, "reset_critics", False)
         and checkpoint_state.get("objective_fingerprint") != objective_fingerprint
     ):
         raise RuntimeError(
             "checkpoint and warmup dataset objective fingerprints do not match; "
-            "use --reset-critics when migrating an actor to the v2 objective"
+            "use --reset-critics when migrating an actor to a new objective"
         )
     model, preprocessor = load_safe_navila(
         args.model_path,
@@ -125,6 +293,10 @@ def warmup(args):
         "policy_version": int(checkpoint_state.get("policy_version", 0)),
         "critics_reset": bool(getattr(args, "reset_critics", False)),
     }
+    if "lagrange_multiplier" in checkpoint_state:
+        state["lagrange_multiplier"] = float(
+            checkpoint_state["lagrange_multiplier"]
+        )
 
     def validated_samples():
         for frames, metadata in iter_samples(args.dataset_dir, args.split):
@@ -175,7 +347,11 @@ def _load_on_policy_samples(args):
             continue
         episodes[str(metadata["episode_id"])].append((frames, metadata))
         count += 1
-        if args.max_samples and count >= args.max_samples:
+        if (
+            args.max_samples
+            and count >= args.max_samples
+            and bool(metadata.get("done", False))
+        ):
             break
     if not episodes:
         raise RuntimeError("no structured on-policy transitions in rollout dataset")
@@ -185,6 +361,27 @@ def _load_on_policy_samples(args):
     for episode_id, episode_samples in episodes.items():
         episode_samples.sort(key=lambda sample: int(sample[1]["index"]))
         metadata = [sample[1] for sample in episode_samples]
+        strict_v4 = getattr(args, "rollout_schema", None) == LIVE_SCHEMA_VERSION
+        if strict_v4:
+            indices = [int(item["index"]) for item in metadata]
+            if indices != list(range(len(indices))) or not bool(metadata[-1]["done"]):
+                raise RuntimeError(
+                    f"v4 rollout episode {episode_id} is incomplete or non-contiguous"
+                )
+        episode_costs[episode_id] = sum(float(item["cost"]) for item in metadata)
+        if any(
+            not bool(
+                item.get(
+                    "ppo_eligible",
+                    item.get("actor_eligible", not strict_v4),
+                )
+            )
+            for item in metadata
+        ):
+            # A missing navigation reward invalidates the temporal GAE chain.
+            # Preserve its episode cost for the constraint statistic, but do
+            # not construct actor/reward advantages from a partial episode.
+            continue
         dones = [bool(item["done"]) for item in metadata]
         reward_advantages, reward_returns = compute_gae(
             [item["reward"] for item in metadata],
@@ -206,7 +403,8 @@ def _load_on_policy_samples(args):
             sample[1]["ppo_reward_return"] = float(reward_returns[index])
             sample[1]["ppo_cost_return"] = float(cost_returns[index])
             samples.append(sample)
-        episode_costs[episode_id] = sum(float(item["cost"]) for item in metadata)
+    if not samples:
+        raise RuntimeError("no actor-eligible complete episodes in rollout dataset")
     return samples, episode_costs
 
 
@@ -259,7 +457,7 @@ def _validate_sample_objective(samples, manifest):
             )
         if fingerprints != {None}:
             raise RuntimeError(
-                "legacy rollout samples must not contain a v2 objective fingerprint"
+                "legacy rollout samples must not contain an objective fingerprint"
             )
         return
     if schemas != {expected_schema}:
@@ -270,7 +468,7 @@ def _validate_sample_objective(samples, manifest):
         raise RuntimeError(
             "rollout sample objective fingerprints do not match the manifest"
         )
-    if expected_schema == "safe-vln-go2-v2":
+    if expected_schema in VERSIONED_DATASET_SCHEMAS:
         policy_fingerprints = {
             sample[1].get("policy_objective_fingerprint") for sample in samples
         }
@@ -286,7 +484,13 @@ def train(args):
         raise ValueError("constrained PPO requires a warmup --checkpoint")
     if getattr(args, "reset_critics", False):
         raise ValueError("--reset-critics is valid only for warmup-critics")
+    if float(getattr(args, "oracle_ce_coef", 0.0)) < 0:
+        raise ValueError("--oracle-ce-coef must be non-negative")
+    if float(getattr(args, "oracle_stop_weight", 5.0)) <= 0:
+        raise ValueError("--oracle-stop-weight must be positive")
     manifest = _dataset_manifest(args.rollout_dir)
+    if manifest.get("dataset_role") == "eval":
+        raise RuntimeError("evaluation datasets cannot be used for PPO training")
     checkpoint_state = _checkpoint_state(args.checkpoint)
     checkpoint_policy_version = checkpoint_state.get("policy_version")
     if (
@@ -319,13 +523,7 @@ def train(args):
         checkpoint=args.checkpoint,
     )
     model.train()
-    if hasattr(model.base_model, "gradient_checkpointing_enable"):
-        try:
-            model.base_model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-        except TypeError:
-            model.base_model.gradient_checkpointing_enable()
+    _enable_gradient_checkpointing(model)
     navila_model = model._navila_model()
     if navila_model is not None and hasattr(navila_model.llm, "model"):
         if not navila_model.llm.model.training:
@@ -342,17 +540,31 @@ def train(args):
             normalize_advantages=False,
         ),
     )
+    args.rollout_schema = schema
     samples, episode_costs = _load_on_policy_samples(args)
     _validate_sample_objective(samples, manifest)
     _validate_rollout_policy_version(samples, args.policy_version)
     _normalize_rollout_advantages(samples)
     mean_cost = sum(episode_costs.values()) / len(episode_costs)
+    lagrange_before = _initial_lagrange_multiplier(args, checkpoint_state)
     lagrange = LagrangeController(
         cost_limit=args.cost_limit,
-        multiplier=args.initial_lagrange_multiplier,
+        multiplier=lagrange_before,
         learning_rate=args.lagrange_lr,
     )
     lagrange.update(mean_cost)
+    print(
+        json.dumps(
+            {
+                "constraint/mean_episode_cost": mean_cost,
+                "constraint/cost_limit": args.cost_limit,
+                "constraint/excess": mean_cost - args.cost_limit,
+                "constraint/lambda_before": lagrange_before,
+                "constraint/lambda_after": lagrange.multiplier,
+            }
+        ),
+        flush=True,
+    )
 
     update = 0
     for epoch in range(args.ppo_epochs):
@@ -385,6 +597,39 @@ def train(args):
                 "cost_advantages": tensor("normalized_cost_advantage"),
                 "reward_returns": tensor("ppo_reward_return"),
                 "cost_returns": tensor("ppo_cost_return"),
+                "oracle_action_ids": torch.tensor(
+                    [
+                        int(metadata.get("oracle_action_id") or 0)
+                        for _, metadata in mini_batch
+                    ],
+                    dtype=torch.long,
+                    device=device,
+                ),
+                "oracle_mask": torch.tensor(
+                    [
+                        bool(metadata.get("oracle_eligible", False))
+                        for _, metadata in mini_batch
+                    ],
+                    dtype=torch.bool,
+                    device=device,
+                ),
+                "oracle_sample_weights": torch.tensor(
+                    [
+                        (
+                            float(args.oracle_stop_weight)
+                            if metadata.get("oracle_action_id") == 9
+                            else 1.0
+                        )
+                        for _, metadata in mini_batch
+                    ],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "oracle_ce_coef": (
+                    float(args.oracle_ce_coef)
+                    if schema == LIVE_SCHEMA_VERSION
+                    else 0.0
+                ),
             }
             stats = ppo.step(batch, lagrange.multiplier)
             if torch.cuda.is_available():
@@ -412,6 +657,8 @@ def train(args):
         "policy_version": args.policy_version + 1,
         "updates": update,
         "lagrange_multiplier": lagrange.multiplier,
+        "lagrange_multiplier_before_update": lagrange_before,
+        "constraint_excess": mean_cost - args.cost_limit,
         "mean_episode_cost": mean_cost,
         "cost_limit": args.cost_limit,
         "gamma": args.gamma,
@@ -420,6 +667,7 @@ def train(args):
         "schema_version": schema,
         "objective_fingerprint": objective_fingerprint,
         "objective_config": objective_config or None,
+        "oracle_stop_weight": float(args.oracle_stop_weight),
     }
     save_checkpoint(model, optimizer, args.output_dir, state)
     return 0

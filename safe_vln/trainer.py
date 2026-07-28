@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 
 def normalize_advantage(value: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
@@ -31,6 +32,11 @@ def constrained_ppo_loss(
     cost_value_coef: float = 0.5,
     entropy_coef: float = 0.01,
     normalize_advantages: bool = True,
+    action_logits: torch.Tensor | None = None,
+    oracle_action_ids: torch.Tensor | None = None,
+    oracle_mask: torch.Tensor | None = None,
+    oracle_sample_weights: torch.Tensor | None = None,
+    oracle_ce_coef: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     if normalize_advantages:
         reward_advantages = normalize_advantage(reward_advantages)
@@ -48,6 +54,45 @@ def constrained_ppo_loss(
         + cost_value_coef * cost_value_loss
         + entropy_coef * entropy_loss
     )
+    oracle_loss = torch.zeros((), device=total.device, dtype=total.dtype)
+    oracle_stop_loss = torch.zeros((), device=total.device, dtype=total.dtype)
+    oracle_stop_accuracy = 0.0
+    oracle_samples = 0
+    oracle_stop_samples = 0
+    if oracle_ce_coef:
+        if action_logits is None or oracle_action_ids is None or oracle_mask is None:
+            raise ValueError("oracle CE requires logits, action IDs, and a mask")
+        mask = oracle_mask.to(dtype=torch.bool, device=action_logits.device)
+        if mask.any():
+            targets = oracle_action_ids.to(action_logits.device)[mask]
+            per_sample_loss = F.cross_entropy(
+                action_logits[mask],
+                targets,
+                reduction="none",
+            )
+            if oracle_sample_weights is None:
+                weights = torch.ones_like(per_sample_loss)
+            else:
+                weights = oracle_sample_weights.to(
+                    device=action_logits.device,
+                    dtype=per_sample_loss.dtype,
+                )[mask]
+                if (
+                    not torch.isfinite(weights).all()
+                    or (weights <= 0).any()
+                ):
+                    raise ValueError("oracle sample weights must be finite and positive")
+            oracle_loss = (per_sample_loss * weights).sum() / weights.sum()
+            stop_mask = targets == 9
+            oracle_samples = int(mask.sum().item())
+            oracle_stop_samples = int(stop_mask.sum().item())
+            if stop_mask.any():
+                oracle_stop_loss = per_sample_loss[stop_mask].mean()
+                predictions = action_logits[mask].argmax(dim=-1)
+                oracle_stop_accuracy = float(
+                    (predictions[stop_mask] == 9).float().mean().detach().item()
+                )
+            total = total + float(oracle_ce_coef) * oracle_loss
     stats = {
         "loss/total": float(total.detach().item()),
         "loss/policy": float(policy_loss.detach().item()),
@@ -56,6 +101,11 @@ def constrained_ppo_loss(
         "policy/entropy": float(entropy.detach().mean().item()),
         "policy/ratio": float(ratio.detach().mean().item()),
         "policy/safe_advantage": float(safe_advantages.detach().mean().item()),
+        "loss/oracle_ce": float(oracle_loss.detach().item()),
+        "loss/oracle_stop_ce": float(oracle_stop_loss.detach().item()),
+        "oracle/samples": oracle_samples,
+        "oracle/stop_samples": oracle_stop_samples,
+        "oracle/stop_accuracy": oracle_stop_accuracy,
     }
     return total, stats
 

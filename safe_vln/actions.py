@@ -148,3 +148,27 @@ def normalize_policy_response(response: Any) -> dict[str, Any]:
         }
     )
     return result
+
+
+def has_valid_policy_statistics(
+    policy_output: Mapping[str, Any],
+    *,
+    objective_fingerprint: str | None,
+) -> bool:
+    """Return whether a response is safe to use as an on-policy PPO sample."""
+    if objective_fingerprint is None:
+        return False
+    if policy_output.get("objective_fingerprint") != objective_fingerprint:
+        return False
+    if policy_output.get("policy_version") is None:
+        return False
+    if policy_output.get("action_probabilities") is None:
+        return False
+    return all(
+        value is not None and math.isfinite(float(value))
+        for value in (
+            policy_output.get("log_prob"),
+            policy_output.get("reward_value"),
+            policy_output.get("cost_value"),
+        )
+    )

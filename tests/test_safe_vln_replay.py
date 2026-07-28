@@ -1,9 +1,16 @@
+import gzip
 import json
+import math
 
 import pytest
 from PIL import Image
 
-from safe_vln.replay import load_r2r_replay_episode
+from safe_vln.replay import (
+    habitat_heading_to_isaac,
+    habitat_position_to_isaac,
+    load_r2r_replay_episode,
+    load_vlnce_episode_metadata,
+)
 
 
 def _write_image(path, value):
@@ -14,6 +21,12 @@ def _write_image(path, value):
 def _write_annotations(root, records):
     root.mkdir(parents=True, exist_ok=True)
     (root / "annotations.json").write_text(json.dumps(records), encoding="utf-8")
+
+
+def _write_gzip_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as output:
+        json.dump(payload, output)
 
 
 def _record(video_id, frames, *, action="The next action is move forward 25 cm.", query="go"):
@@ -145,3 +158,81 @@ def test_action_like_but_non_official_oracle_labels_are_rejected(
 
     with pytest.raises(ValueError, match="unknown oracle action"):
         load_r2r_replay_episode(root, 3)
+
+
+def test_habitat_pose_conversion_matches_matterport_usd_axes():
+    assert habitat_position_to_isaac([15.0, 0.2, -4.5]) == (
+        15.0,
+        4.5,
+        0.2,
+    )
+    rotation = habitat_heading_to_isaac(
+        [0.0, 0.5, 0.0, math.sqrt(3.0) / 2.0]
+    )
+    assert rotation == pytest.approx(
+        [math.cos(math.radians(75)), 0.0, 0.0, math.sin(math.radians(75))]
+    )
+
+
+def test_loads_original_vlnce_metadata_gt_and_builds_isaac_episode(tmp_path):
+    metadata_path = tmp_path / "train" / "train.json.gz"
+    gt_path = tmp_path / "train" / "train_gt.json.gz"
+    _write_gzip_json(
+        metadata_path,
+        {
+            "episodes": [
+                {
+                    "episode_id": 5372,
+                    "trajectory_id": 3558,
+                    "scene_id": "mp3d/scene/scene.glb",
+                    "start_position": [-12.5, 0.1, -18.8],
+                    "start_rotation": [0.0, math.sqrt(3) / 2, 0.0, 0.5],
+                    "info": {"geodesic_distance": 9.7},
+                    "goals": [{"position": [-13.6, 0.1, -9.1], "radius": 3.0}],
+                    "instruction": {
+                        "instruction_text": "go",
+                        "instruction_tokens": [1, 2],
+                    },
+                    "reference_path": [
+                        [-12.5, 0.1, -18.8],
+                        [-13.6, 0.1, -9.1],
+                    ],
+                }
+            ]
+        },
+    )
+    _write_gzip_json(
+        gt_path,
+        {
+            "5372": {
+                "actions": [2, 1, 0],
+                "locations": [
+                    [-12.5, 0.1, -18.8],
+                    [-13.6, 0.1, -9.1],
+                ],
+                "forward_steps": 1,
+            }
+        },
+    )
+
+    metadata = load_vlnce_episode_metadata(metadata_path, 5372)
+    episode = metadata.to_isaac_episode()
+
+    assert metadata.episode_id == "5372"
+    assert metadata.gt_path == gt_path.resolve()
+    assert episode["episode_id"] == 5372
+    assert episode["scene_id"] == "mp3d/scene/scene.glb"
+    assert episode["start_position"] == pytest.approx([-12.5, 18.8, 0.1])
+    assert episode["goals"][0]["position"] == pytest.approx([-13.6, 9.1, 0.1])
+    assert episode["gt_actions"] == [2, 1, 0]
+    assert episode["gt_locations"][-1] == pytest.approx([-13.6, 9.1, 0.1])
+    assert metadata.alignment_record()["vlnce_episode_id"] == "5372"
+
+
+def test_vlnce_metadata_requires_matching_episode_and_gt(tmp_path):
+    metadata_path = tmp_path / "train.json.gz"
+    _write_gzip_json(metadata_path, {"episodes": []})
+    _write_gzip_json(tmp_path / "train_gt.json.gz", {})
+
+    with pytest.raises(ValueError, match="found 0 times"):
+        load_vlnce_episode_metadata(metadata_path, 99)

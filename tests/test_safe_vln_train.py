@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from safe_vln import train
+from safe_vln.live_render import LIVE_SCHEMA_VERSION
 from safe_vln.objective import build_objective_config, default_cost_profile
 
 
@@ -123,3 +124,79 @@ def test_legacy_v1_samples_may_omit_schema_but_cannot_mix_v2_metadata():
             ],
             manifest,
         )
+
+
+def test_v3_live_objective_uses_v2_objective_fingerprint_contract():
+    objective = build_objective_config(default_cost_profile())
+    manifest = {
+        "schema_version": LIVE_SCHEMA_VERSION,
+        "objective_fingerprint": objective["fingerprint"],
+        "objective_config": objective,
+        "dataset_role": "train",
+    }
+    assert train._validate_objective_compatibility(
+        manifest, {"objective_fingerprint": objective["fingerprint"]}
+    ) == (LIVE_SCHEMA_VERSION, objective["fingerprint"])
+    train._validate_sample_objective(
+        [
+            (
+                None,
+                {
+                    "schema_version": LIVE_SCHEMA_VERSION,
+                    "objective_fingerprint": objective["fingerprint"],
+                    "policy_objective_fingerprint": objective["fingerprint"],
+                },
+            )
+        ],
+        manifest,
+    )
+
+
+def test_v3_invalid_navigation_reward_excludes_whole_actor_episode(monkeypatch):
+    source = [
+        (
+            None,
+            {
+                **_transition("invalid", 0, 1.0, 0.2, False),
+                "actor_eligible": True,
+            },
+        ),
+        (
+            None,
+            {
+                **_transition("invalid", 1, 0.0, 0.5, True),
+                "actor_eligible": False,
+            },
+        ),
+        (
+            None,
+            {
+                **_transition("valid", 0, 2.0, 0.0, True),
+                "actor_eligible": True,
+            },
+        ),
+    ]
+    monkeypatch.setattr(train, "iter_samples", lambda *args, **kwargs: iter(source))
+    args = SimpleNamespace(
+        rollout_dir="unused",
+        split="train",
+        max_samples=None,
+        gamma=0.5,
+        gae_lambda=1.0,
+    )
+
+    samples, costs = train._load_on_policy_samples(args)
+
+    assert {metadata["episode_id"] for _, metadata in samples} == {"valid"}
+    assert costs == {"invalid": pytest.approx(0.7), "valid": 0.0}
+
+
+def test_lagrange_inherits_checkpoint_unless_explicitly_overridden():
+    inherited = SimpleNamespace(initial_lagrange_multiplier=None)
+    explicit = SimpleNamespace(initial_lagrange_multiplier=0.2)
+    assert train._initial_lagrange_multiplier(
+        inherited, {"lagrange_multiplier": 0.7}
+    ) == pytest.approx(0.7)
+    assert train._initial_lagrange_multiplier(
+        explicit, {"lagrange_multiplier": 0.7}
+    ) == pytest.approx(0.2)

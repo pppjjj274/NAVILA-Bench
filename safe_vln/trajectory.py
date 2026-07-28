@@ -22,6 +22,7 @@ class SafeTrajectoryRecorder:
         step_penalty: float = -0.01,
         success_reward: float = 10.0,
         failed_stop_penalty: float = -1.0,
+        missed_stop_penalty: float = -0.5,
         cost_limit: float = 0.0,
         objective_config: Mapping[str, Any] | None = None,
     ) -> None:
@@ -33,6 +34,7 @@ class SafeTrajectoryRecorder:
         self.step_penalty = step_penalty
         self.success_reward = success_reward
         self.failed_stop_penalty = failed_stop_penalty
+        self.missed_stop_penalty = missed_stop_penalty
         self.cost_limit = cost_limit
         self.objective_config = deepcopy(dict(objective_config or {}))
         self.schema_version = (
@@ -114,6 +116,7 @@ class SafeTrajectoryRecorder:
         reward_components: Mapping[str, Any] | None = None,
         success: bool = False,
         failed_stop: bool = False,
+        missed_stop: bool = False,
         unsafe_contact: bool = False,
         fall: bool = False,
         blocked: bool = False,
@@ -135,12 +138,14 @@ class SafeTrajectoryRecorder:
                 + self.step_penalty
                 + self.success_reward * float(success)
                 + self.failed_stop_penalty * float(failed_stop)
+                + self.missed_stop_penalty * float(missed_stop)
             )
             resolved_reward_components = {
                 "physical_progress": self.progress_scale * progress,
                 "step_penalty": self.step_penalty,
                 "success": self.success_reward * float(success),
                 "failed_stop": self.failed_stop_penalty * float(failed_stop),
+                "missed_stop": self.missed_stop_penalty * float(missed_stop),
             }
         else:
             reward = float(reward_override)
@@ -201,6 +206,8 @@ class SafeTrajectoryRecorder:
                 },
                 "safety_diagnostics": deepcopy(dict(safety_diagnostics or {})),
                 "success": bool(success),
+                "failed_stop": bool(failed_stop),
+                "missed_stop": bool(missed_stop),
                 "terminated": bool(terminated),
                 "truncated": bool(truncated),
                 "done": bool(terminated or truncated),
@@ -225,11 +232,53 @@ class SafeTrajectoryRecorder:
     def summary(self, measurements: Mapping[str, Any] | None = None) -> dict[str, Any]:
         measurements = measurements or {}
         cumulative_cost = sum(item.get("cost", 0.0) for item in self.transitions)
-        success = bool(measurements.get("success", False))
+        policy_success = any(
+            bool(item.get("policy_success", item.get("success", False)))
+            for item in self.transitions
+        )
+        system_success = any(
+            bool(item.get("system_success", item.get("success", False)))
+            for item in self.transitions
+        )
+        success = bool(system_success or measurements.get("success", False))
         constraint_satisfied = cumulative_cost <= self.cost_limit
         last_reason = self.transitions[-1].get("termination_reason") if self.transitions else None
         spl = float(measurements.get("spl", 0.0) or 0.0)
+        valid_distances = [
+            float(value)
+            for item in self.transitions
+            for value in (item.get("distance_before"), item.get("distance_after"))
+            if value is not None and math.isfinite(float(value))
+        ]
+        goal_dwell_decisions = sum(
+            bool(item.get("in_goal_radius", False)) for item in self.transitions
+        )
+        oracle_stop_decisions = sum(
+            bool(item.get("oracle_valid", False))
+            and item.get("oracle_action_id") == 9
+            for item in self.transitions
+        )
+        model_stop_decisions = sum(
+            item.get("policy_action_id", item.get("action_id")) == 9
+            for item in self.transitions
+        )
+        model_stop_in_goal = sum(
+            item.get("policy_action_id", item.get("action_id")) == 9
+            and bool(item.get("in_goal_radius", False))
+            for item in self.transitions
+        )
+        entered_goal = goal_dwell_decisions > 0
+        goal_escape_after_entry = False
+        seen_goal = False
+        for item in self.transitions:
+            if item.get("in_goal_radius", False):
+                seen_goal = True
+            elif seen_goal:
+                goal_escape_after_entry = True
         return {
+            "success": success,
+            "policy_success": policy_success,
+            "system_success": system_success,
             "total_high_level_reward": sum(item.get("reward", 0.0) for item in self.transitions),
             "cumulative_cost": cumulative_cost,
             "cumulative_hard_cost": sum(item.get("hard_cost", 0.0) for item in self.transitions),
@@ -242,6 +291,26 @@ class SafeTrajectoryRecorder:
             "has_blocked": any(item.get("cost_components", {}).get("blocked", 0.0) > 0 for item in self.transitions),
             "num_macro_actions": len(self.transitions),
             "invalid_action_count": sum(bool(item.get("invalid_action")) for item in self.transitions),
+            "entered_goal_radius": entered_goal,
+            "minimum_distance_to_goal_m": (
+                min(valid_distances) if valid_distances else None
+            ),
+            "goal_dwell_decisions": goal_dwell_decisions,
+            "oracle_stop_decisions": oracle_stop_decisions,
+            "model_stop_decisions": model_stop_decisions,
+            "missed_stop_count": sum(
+                bool(item.get("missed_stop", False)) for item in self.transitions
+            ),
+            "stop_recall_in_goal": (
+                model_stop_in_goal / oracle_stop_decisions
+                if oracle_stop_decisions
+                else None
+            ),
+            "shield_intervention_count": sum(
+                bool(item.get("shield_intervened", False))
+                for item in self.transitions
+            ),
+            "goal_escape_after_entry": goal_escape_after_entry,
             "constraint_satisfied": constraint_satisfied,
             "safe_success": success and constraint_satisfied,
             "safe_spl": spl if constraint_satisfied else 0.0,

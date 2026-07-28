@@ -8,6 +8,7 @@ from safe_vln.actions import (
     ACTIONS,
     NAVILA_ACTION_RESPONSES,
     action_from_text,
+    has_valid_policy_statistics,
     normalize_policy_response,
 )
 from safe_vln.cmdp import LagrangeController, compute_gae, compute_returns, safe_advantage
@@ -49,6 +50,26 @@ def test_structured_response_records_normalized_action_probabilities():
     assert normalize_policy_response(
         {"action_id": 6, "objective_fingerprint": "objective"}
     )["objective_fingerprint"] == "objective"
+
+
+def test_ppo_statistics_require_matching_objective_and_complete_values():
+    output = normalize_policy_response(
+        {
+            "action_id": 8,
+            "log_prob": -1.0,
+            "reward_value": 0.5,
+            "cost_value": 0.2,
+            "policy_version": 3,
+            "objective_fingerprint": "objective-a",
+            "action_probabilities": [0.1] * len(ACTIONS),
+        }
+    )
+    assert has_valid_policy_statistics(
+        output, objective_fingerprint="objective-a"
+    )
+    assert not has_valid_policy_statistics(
+        output, objective_fingerprint="objective-b"
+    )
 
 
 def test_reward_cost_returns_and_lagrange_direction():
@@ -105,6 +126,36 @@ def test_trajectory_records_blocked_as_terminal_cost():
     assert recorder.summary()["has_blocked"] is True
 
 
+def test_trajectory_penalizes_and_summarizes_missed_stop():
+    recorder = SafeTrajectoryRecorder(
+        episode_id="1",
+        scene_id="scene",
+        instruction="go",
+        step_penalty=-0.01,
+        missed_stop_penalty=-0.5,
+    )
+    recorder.begin(normalize_policy_response({"action_id": 8}), 0.5)
+    item = recorder.finish(distance_after=0.4, missed_stop=True)
+    recorder.transitions[-1].update(
+        {
+            "in_goal_radius": True,
+            "oracle_valid": True,
+            "oracle_action_id": 9,
+            "policy_action_id": 8,
+            "goal_radius_m": 3.0,
+        }
+    )
+    item = recorder.transitions[-1]
+    recorder.finalize()
+    summary = recorder.summary()
+    assert item["reward"] == pytest.approx(-0.41)
+    assert summary["entered_goal_radius"] is True
+    assert summary["missed_stop_count"] == 1
+    assert summary["oracle_stop_decisions"] == 1
+    assert summary["model_stop_decisions"] == 0
+    assert summary["stop_recall_in_goal"] == 0.0
+
+
 def test_trajectory_accepts_oracle_reward_override_and_keeps_physical_progress():
     recorder = SafeTrajectoryRecorder(
         episode_id="1",
@@ -148,3 +199,53 @@ def test_constrained_ppo_loss_is_finite_and_backpropagates():
     assert new_log_probs.grad is not None
     assert reward_values.grad is not None
     assert cost_values.grad is not None
+
+
+def test_constrained_ppo_adds_masked_oracle_cross_entropy():
+    logits = torch.zeros((2, len(ACTIONS)), requires_grad=True)
+    loss, stats = constrained_ppo_loss(
+        new_log_probs=torch.tensor([-0.2, -0.2], requires_grad=True),
+        old_log_probs=torch.tensor([-0.2, -0.2]),
+        reward_advantages=torch.tensor([0.0, 0.0]),
+        cost_advantages=torch.tensor([0.0, 0.0]),
+        reward_values=torch.tensor([0.0, 0.0], requires_grad=True),
+        cost_values=torch.tensor([0.0, 0.0], requires_grad=True),
+        reward_returns=torch.tensor([0.0, 0.0]),
+        cost_returns=torch.tensor([0.0, 0.0]),
+        entropy=torch.tensor([0.0, 0.0]),
+        lagrange_multiplier=0.0,
+        action_logits=logits,
+        oracle_action_ids=torch.tensor([3, 4]),
+        oracle_mask=torch.tensor([True, False]),
+        oracle_ce_coef=0.05,
+    )
+    assert stats["loss/oracle_ce"] == pytest.approx(math.log(len(ACTIONS)))
+    loss.backward()
+    assert logits.grad is not None
+    assert torch.count_nonzero(logits.grad[1]) == 0
+
+
+def test_oracle_stop_weight_changes_ce_and_reports_stop_accuracy():
+    logits = torch.zeros((2, len(ACTIONS)), requires_grad=True)
+    logits.data[0, 0] = 2.0
+    logits.data[1, 9] = 2.0
+    _, stats = constrained_ppo_loss(
+        new_log_probs=torch.tensor([0.0, 0.0], requires_grad=True),
+        old_log_probs=torch.tensor([0.0, 0.0]),
+        reward_advantages=torch.tensor([0.0, 0.0]),
+        cost_advantages=torch.tensor([0.0, 0.0]),
+        reward_values=torch.tensor([0.0, 0.0], requires_grad=True),
+        cost_values=torch.tensor([0.0, 0.0], requires_grad=True),
+        reward_returns=torch.tensor([0.0, 0.0]),
+        cost_returns=torch.tensor([0.0, 0.0]),
+        entropy=torch.tensor([0.0, 0.0]),
+        lagrange_multiplier=0.0,
+        action_logits=logits,
+        oracle_action_ids=torch.tensor([0, 9]),
+        oracle_mask=torch.tensor([True, True]),
+        oracle_sample_weights=torch.tensor([1.0, 5.0]),
+        oracle_ce_coef=1.0,
+    )
+    assert stats["oracle/samples"] == 2
+    assert stats["oracle/stop_samples"] == 1
+    assert stats["oracle/stop_accuracy"] == 1.0

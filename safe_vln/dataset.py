@@ -5,12 +5,49 @@ from __future__ import annotations
 from io import BytesIO
 import json
 from pathlib import Path
+import re
+import shutil
 import tarfile
 from typing import Any, Iterable, Iterator, Mapping, Sequence
+import uuid
 
 from PIL import Image
 
 from .objective import SCHEMA_VERSION, validate_objective_config
+
+
+def _encode_jpeg(frame: Image.Image, quality: int) -> bytes:
+    """Encode without relying on Pillow plugins after Isaac Kit startup."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        buffer = BytesIO()
+        frame.convert("RGB").save(buffer, format="JPEG", quality=quality)
+        return buffer.getvalue()
+
+    array = np.asarray(frame, dtype=np.uint8)
+    if array.ndim == 2:
+        encoded_input = array
+    elif array.ndim == 3 and array.shape[2] == 3:
+        encoded_input = cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+    elif array.ndim == 3 and array.shape[2] == 4:
+        encoded_input = cv2.cvtColor(array, cv2.COLOR_RGBA2BGR)
+    else:
+        raise ValueError(
+            f"unsupported frame array shape for JPEG encoding: {array.shape}"
+        )
+    success, encoded = cv2.imencode(
+        ".jpg",
+        encoded_input,
+        [cv2.IMWRITE_JPEG_QUALITY, int(quality)],
+    )
+    if not success:
+        raise RuntimeError("OpenCV failed to encode a Safe-VLN JPEG frame")
+    payload = encoded.tobytes()
+    if not payload.startswith(b"\xff\xd8") or not payload.endswith(b"\xff\xd9"):
+        raise RuntimeError("OpenCV returned data without valid JPEG markers")
+    return payload
 
 
 class SafeVLNShardWriter:
@@ -42,7 +79,9 @@ class SafeVLNShardWriter:
         )
         self.objective_fingerprint = self.objective_config.get("fingerprint")
         if self.schema_version == SCHEMA_VERSION and not self.objective_fingerprint:
-            raise ValueError("v2 Safe-VLN shards require an objective fingerprint")
+            raise ValueError(
+                "versioned Safe-VLN shards require an objective fingerprint"
+            )
         manifest_path = self.output_dir / "manifest.json"
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -89,9 +128,10 @@ class SafeVLNShardWriter:
         if not safe_key:
             raise ValueError("sample key cannot be empty")
         for index, frame in enumerate(frames):
-            buffer = BytesIO()
-            frame.convert("RGB").save(buffer, format="JPEG", quality=self.jpeg_quality)
-            self._add_bytes(f"{safe_key}.{index}.jpg", buffer.getvalue())
+            self._add_bytes(
+                f"{safe_key}.{index}.jpg",
+                _encode_jpeg(frame, self.jpeg_quality),
+            )
         payload = json.dumps(dict(metadata), ensure_ascii=False, sort_keys=True).encode("utf-8")
         self._add_bytes(f"{safe_key}.json", payload)
         self.sample_count += 1
@@ -151,8 +191,178 @@ class SafeVLNShardWriter:
         return False
 
 
+class SafeVLNEpisodeWriter:
+    """Transactional episode writer used by strict live-render collection.
+
+    Shards are first written beneath ``.incomplete`` and only become visible to
+    readers after :meth:`commit` atomically publishes the complete episode.
+    """
+
+    def __init__(
+        self,
+        output_dir: str | Path,
+        episode_id: str | int,
+        *,
+        dataset_role: str,
+        split: str,
+        schema_version: str,
+        objective_config: Mapping[str, Any],
+        samples_per_shard: int = 256,
+    ) -> None:
+        if dataset_role not in {"train", "eval"}:
+            raise ValueError("dataset_role must be 'train' or 'eval'")
+        self.output_dir = Path(output_dir)
+        self.episode_id = str(episode_id)
+        self.dataset_role = dataset_role
+        self.split = split
+        self.schema_version = schema_version
+        self.objective_config = validate_objective_config(objective_config)
+        self.objective_fingerprint = self.objective_config.get("fingerprint")
+        root_manifest_path = self.output_dir / "manifest.json"
+        if root_manifest_path.exists():
+            root_manifest = json.loads(
+                root_manifest_path.read_text(encoding="utf-8")
+            )
+            expected = (
+                schema_version,
+                self.objective_fingerprint,
+                dataset_role,
+                split,
+            )
+            actual = (
+                root_manifest.get("schema_version"),
+                root_manifest.get("objective_fingerprint"),
+                root_manifest.get("dataset_role"),
+                root_manifest.get("split"),
+            )
+            if actual != expected:
+                raise ValueError(
+                    "strict episode contract does not match the dataset manifest"
+                )
+        safe_episode = re.sub(r"[^A-Za-z0-9._-]+", "_", self.episode_id).strip("_")
+        if not safe_episode:
+            raise ValueError("episode_id has no filesystem-safe characters")
+        self.safe_episode = safe_episode
+        self.pending_dir = (
+            self.output_dir
+            / ".incomplete"
+            / f"{safe_episode}-{uuid.uuid4().hex}"
+        )
+        self.final_dir = self.output_dir / "completed" / safe_episode
+        self.writer = SafeVLNShardWriter(
+            self.pending_dir,
+            split=split,
+            samples_per_shard=samples_per_shard,
+            schema_version=schema_version,
+            objective_config=self.objective_config,
+        )
+        self._finished = False
+
+    def add(
+        self,
+        key: str,
+        frames: Sequence[Image.Image],
+        metadata: Mapping[str, Any],
+    ) -> None:
+        if self._finished:
+            raise RuntimeError("episode writer is already finished")
+        self.writer.add(key, frames, metadata)
+
+    def _write_episode_manifest(self) -> None:
+        path = self.pending_dir / "manifest.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest.update(
+            {
+                "dataset_role": self.dataset_role,
+                "episode_id": self.episode_id,
+                "transactional_episode": True,
+            }
+        )
+        path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    def _update_root_manifest(self) -> None:
+        manifests = []
+        for path in sorted((self.output_dir / "completed").glob("*/manifest.json")):
+            manifests.append(json.loads(path.read_text(encoding="utf-8")))
+        if not manifests:
+            return
+        contracts = {
+            (
+                item.get("schema_version"),
+                item.get("objective_fingerprint"),
+                item.get("dataset_role"),
+                item.get("split"),
+            )
+            for item in manifests
+        }
+        if len(contracts) != 1:
+            raise RuntimeError(
+                "completed strict episodes contain incompatible dataset contracts"
+            )
+        schema, fingerprint, role, split = next(iter(contracts))
+        root_manifest = {
+            "schema_version": schema,
+            "objective_fingerprint": fingerprint,
+            "objective_config": manifests[0].get("objective_config"),
+            "dataset_role": role,
+            "split": split,
+            "transactional_episodes": True,
+            "completed_episodes": len(manifests),
+            "total_samples": sum(
+                int(item.get("total_samples", 0)) for item in manifests
+            ),
+            "episode_ids": sorted(str(item["episode_id"]) for item in manifests),
+        }
+        temporary = self.output_dir / "manifest.json.incomplete"
+        temporary.write_text(
+            json.dumps(root_manifest, indent=2), encoding="utf-8"
+        )
+        temporary.replace(self.output_dir / "manifest.json")
+
+    def commit(self) -> Path:
+        if self._finished:
+            raise RuntimeError("episode writer is already finished")
+        self.writer.close()
+        self._write_episode_manifest()
+        self.final_dir.parent.mkdir(parents=True, exist_ok=True)
+        if self.final_dir.exists():
+            raise FileExistsError(
+                f"strict episode output already exists: {self.final_dir}"
+            )
+        self.pending_dir.replace(self.final_dir)
+        self._update_root_manifest()
+        self._finished = True
+        return self.final_dir
+
+    def abort(self) -> None:
+        if self._finished:
+            return
+        if self.writer._tar is not None:
+            self.writer._tar.close()
+            self.writer._tar = None
+        shutil.rmtree(self.pending_dir, ignore_errors=True)
+        self._finished = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.abort()
+        return False
+
+
+def _shard_paths(dataset_dir: str | Path, split: str) -> list[Path]:
+    root = Path(dataset_dir)
+    paths = set(root.glob(f"{split}-*.tar"))
+    paths.update(root.glob(f"completed/*/{split}-*.tar"))
+    return sorted(paths)
+
+
 def iter_metadata(dataset_dir: str | Path, split: str = "train") -> Iterator[dict[str, Any]]:
-    for shard_path in sorted(Path(dataset_dir).glob(f"{split}-*.tar")):
+    for shard_path in _shard_paths(dataset_dir, split):
         with tarfile.open(shard_path, "r") as archive:
             for member in archive:
                 if member.isfile() and member.name.endswith(".json"):
@@ -163,7 +373,7 @@ def iter_metadata(dataset_dir: str | Path, split: str = "train") -> Iterator[dic
 
 def iter_samples(dataset_dir: str | Path, split: str = "train"):
     """Yield ``(frames, metadata)`` from complete shards."""
-    for shard_path in sorted(Path(dataset_dir).glob(f"{split}-*.tar")):
+    for shard_path in _shard_paths(dataset_dir, split):
         with tarfile.open(shard_path, "r") as archive:
             members = {member.name: member for member in archive if member.isfile()}
             for metadata_name in sorted(name for name in members if name.endswith(".json")):

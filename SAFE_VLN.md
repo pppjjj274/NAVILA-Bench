@@ -12,6 +12,9 @@ This extension adds safety-aware hierarchical navigation to NaVILA-Bench:
 
 Only `go2_matterport_vision` is supported. Safe mode is opt-in and does not change the legacy benchmark.
 
+For strict image/state pairing without Isaac RTX cameras, see
+[`docs/safe_vln_live_render.md`](docs/safe_vln_live_render.md).
+
 ## Environments verified on this machine
 
 Use `vlnce-isaac` for Isaac Lab collection/evaluation:
@@ -63,6 +66,11 @@ macro action and episode immediately. Reward remains separate:
 reward = distance_before - distance_after - 0.01 + 10 * success
 cost   = unsafe_non_foot_contact + fall + blocked
 ```
+
+Strict live-render v4 additionally applies `-0.5` to every movement decision
+made inside the episode's official goal radius. Raw-policy and goal-shield
+results are stored separately; a shield STOP is never labelled as a policy
+success or PPO sample.
 
 ## Evaluation and collection
 
