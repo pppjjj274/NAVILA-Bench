@@ -441,6 +441,16 @@ def add_model_args(parser, *, train=False):
     parser.add_argument("--critic-lr", type=float, default=1e-4)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--reset-critics", action="store_true")
+    parser.add_argument(
+        "--sampling-strategy",
+        choices=(
+            ("sequential", "balanced-ppo")
+            if train
+            else ("sequential", "balanced-critic")
+        ),
+        default="sequential",
+    )
+    parser.add_argument("--sampling-seed", type=int, default=20260729)
     if train:
         parser.add_argument("--rollout-dir", required=True)
         parser.add_argument("--actor-lr", type=float, default=1e-5)
@@ -489,6 +499,22 @@ def parse_args():
     actor_warmup.add_argument("--mini-batch-size", type=int, default=1)
     actor_warmup.add_argument("--max-samples", type=int)
     actor_warmup.add_argument("--oracle-stop-weight", type=float, default=5.0)
+    actor_warmup.add_argument(
+        "--sampling-strategy",
+        choices=("sequential", "balanced-oracle"),
+        default="sequential",
+    )
+    actor_warmup.add_argument("--sampling-seed", type=int, default=20260729)
+    actor_warmup.add_argument(
+        "--minimum-stop-accuracy",
+        type=float,
+        default=0.5,
+    )
+    actor_warmup.add_argument(
+        "--minimum-non-stop-macro-accuracy",
+        type=float,
+        default=0.4,
+    )
     train = subparsers.add_parser("train")
     add_model_args(train, train=True)
     summary = subparsers.add_parser("summarize")

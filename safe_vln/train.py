@@ -11,11 +11,18 @@ import torch
 import torch.nn.functional as F
 
 from .cmdp import LagrangeController, compute_gae
-from .dataset import iter_samples
+from .dataset import iter_sample_refs, iter_samples, load_sample_refs
 from .learner import evaluate_selected_actions, save_checkpoint, train_critic_epoch
 from .live_render import LEGACY_LIVE_SCHEMA_VERSIONS, LIVE_SCHEMA_VERSION
 from .navila import load_safe_navila
 from .objective import validate_objective_config
+from .sampling import (
+    deterministic_shuffle,
+    sampling_summary,
+    select_balanced_critic,
+    select_balanced_oracle,
+    select_balanced_ppo,
+)
 from .trainer import PPOConfig, SafePPOOptimizer, normalize_advantage
 
 
@@ -45,6 +52,13 @@ def _dataset_manifest(dataset_dir):
 
 def _checkpoint_state(checkpoint):
     return _read_json(Path(checkpoint) / "trainer_state.json") if checkpoint else {}
+
+
+def _reject_failed_actor_audit(checkpoint_state):
+    if checkpoint_state.get("actor/accepted") is False:
+        raise RuntimeError(
+            "checkpoint failed its actor audit and cannot be used for later stages"
+        )
 
 
 def _validate_objective_compatibility(manifest, checkpoint_state):
@@ -128,6 +142,15 @@ def warmup_actor(args):
         raise ValueError("--oracle-stop-weight must be positive")
     if args.mini_batch_size <= 0:
         raise ValueError("--mini-batch-size must be positive")
+    if args.max_samples is not None and args.max_samples <= 0:
+        raise ValueError("--max-samples must be positive")
+    for name in (
+        "minimum_stop_accuracy",
+        "minimum_non_stop_macro_accuracy",
+    ):
+        value = float(getattr(args, name, 0.0))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be in [0, 1]")
     manifest = _dataset_manifest(args.dataset_dir)
     if manifest.get("dataset_role") != "train":
         raise RuntimeError("actor warmup requires a training dataset")
@@ -158,8 +181,7 @@ def warmup_actor(args):
         raise RuntimeError("fresh NaViLA model has no trainable LoRA parameters")
     optimizer = torch.optim.AdamW(actor_parameters, lr=args.actor_lr)
 
-    samples = []
-    for frames, metadata in iter_samples(args.dataset_dir, args.split):
+    def validate_metadata(metadata):
         if metadata.get("schema_version") != LIVE_SCHEMA_VERSION:
             raise RuntimeError("actor warmup sample schema does not match manifest")
         if metadata.get("objective_fingerprint") != objective_fingerprint:
@@ -167,15 +189,53 @@ def warmup_actor(args):
                 "actor warmup sample objective fingerprint does not match manifest"
             )
         if not bool(metadata.get("oracle_eligible", False)):
-            continue
+            return False
         oracle_action_id = metadata.get("oracle_action_id")
         if oracle_action_id is None:
-            continue
-        samples.append((frames, metadata))
-        if args.max_samples is not None and len(samples) >= args.max_samples:
-            break
+            return False
+        return True
+
+    sampling_strategy = getattr(args, "sampling_strategy", "sequential")
+    sampling_seed = int(getattr(args, "sampling_seed", 20260729))
+    if sampling_strategy == "balanced-oracle":
+        refs = [
+            ref
+            for ref in iter_sample_refs(args.dataset_dir, args.split)
+            if validate_metadata(ref.metadata)
+        ]
+        selected_refs = select_balanced_oracle(
+            refs,
+            max_samples=args.max_samples,
+            seed=sampling_seed,
+        )
+        samples = load_sample_refs(selected_refs)
+    elif sampling_strategy == "sequential":
+        samples = []
+        for frames, metadata in iter_samples(args.dataset_dir, args.split):
+            if not validate_metadata(metadata):
+                continue
+            samples.append((frames, metadata))
+            if args.max_samples is not None and len(samples) >= args.max_samples:
+                break
+    else:
+        raise ValueError(
+            "warmup-actor supports --sampling-strategy=sequential or "
+            "balanced-oracle"
+        )
     if not samples:
         raise RuntimeError("actor warmup found no oracle-eligible samples")
+    sample_stats = sampling_summary(samples)
+    print(
+        json.dumps(
+            {
+                "mode": "warmup-actor-sampling",
+                "strategy": sampling_strategy,
+                "seed": sampling_seed,
+                **sample_stats,
+            }
+        ),
+        flush=True,
+    )
 
     state = {
         "mode": "warmup-actor",
@@ -186,6 +246,9 @@ def warmup_actor(args):
         "policy_version": 0,
         "fresh_lora": True,
         "oracle_stop_weight": float(args.oracle_stop_weight),
+        "sampling_strategy": sampling_strategy,
+        "sampling_seed": sampling_seed,
+        "sampling": sample_stats,
     }
     update = 0
     for epoch in range(args.epochs):
@@ -194,15 +257,19 @@ def warmup_actor(args):
         epoch_correct = 0
         epoch_stop_correct = 0
         epoch_stop_samples = 0
-        for start in range(0, len(samples), args.mini_batch_size):
-            mini_batch = samples[start : start + args.mini_batch_size]
+        epoch_samples = deterministic_shuffle(
+            samples,
+            seed=sampling_seed + epoch,
+            namespace="actor-epoch",
+        )
+        for start in range(0, len(epoch_samples), args.mini_batch_size):
+            mini_batch = epoch_samples[start : start + args.mini_batch_size]
             weights = [
                 float(args.oracle_stop_weight)
                 if int(metadata["oracle_action_id"]) == 9
                 else 1.0
                 for _, metadata in mini_batch
             ]
-            weight_sum = sum(weights)
             optimizer.zero_grad(set_to_none=True)
             batch_loss = 0.0
             for (frames, metadata), weight in zip(mini_batch, weights):
@@ -214,8 +281,9 @@ def warmup_actor(args):
                     device=output.action_logits.device,
                 )
                 loss = F.cross_entropy(output.action_logits, target)
-                (loss * (weight / weight_sum)).backward()
-                batch_loss += float(loss.detach().item()) * weight / weight_sum
+                weighted_loss = loss * (weight / len(mini_batch))
+                weighted_loss.backward()
+                batch_loss += float(weighted_loss.detach().item())
                 prediction = int(output.action_logits.detach().argmax(dim=-1).item())
                 target_id = int(target.item())
                 epoch_correct += int(prediction == target_id)
@@ -247,7 +315,68 @@ def warmup_actor(args):
             }
         )
         print(json.dumps(state), flush=True)
+
+    model.eval()
+    class_samples: dict[int, int] = defaultdict(int)
+    class_correct: dict[int, int] = defaultdict(int)
+    with torch.no_grad():
+        for frames, metadata in samples:
+            prepared = preprocessor(frames, metadata["instruction"])
+            output = model(prepared.input_ids, images=prepared.images)
+            target_id = int(metadata["oracle_action_id"])
+            prediction = int(output.action_logits.argmax(dim=-1).item())
+            class_samples[target_id] += 1
+            class_correct[target_id] += int(prediction == target_id)
+    per_class_accuracy = {
+        str(action_id): class_correct[action_id] / count
+        for action_id, count in sorted(class_samples.items())
+    }
+    non_stop_accuracies = [
+        accuracy
+        for action_id, accuracy in per_class_accuracy.items()
+        if int(action_id) != 9
+    ]
+    stop_accuracy = per_class_accuracy.get("9")
+    non_stop_macro_accuracy = (
+        sum(non_stop_accuracies) / len(non_stop_accuracies)
+        if non_stop_accuracies
+        else None
+    )
+    minimum_stop_accuracy = float(
+        getattr(args, "minimum_stop_accuracy", 0.5)
+    )
+    minimum_non_stop_macro_accuracy = float(
+        getattr(args, "minimum_non_stop_macro_accuracy", 0.4)
+    )
+    accepted = (
+        stop_accuracy is not None
+        and stop_accuracy >= minimum_stop_accuracy
+        and non_stop_macro_accuracy is not None
+        and non_stop_macro_accuracy >= minimum_non_stop_macro_accuracy
+    )
+    state.update(
+        {
+            "actor/audit_class_samples": {
+                str(action_id): count
+                for action_id, count in sorted(class_samples.items())
+            },
+            "actor/audit_per_class_accuracy": per_class_accuracy,
+            "actor/audit_stop_accuracy": stop_accuracy,
+            "actor/audit_non_stop_macro_accuracy": non_stop_macro_accuracy,
+            "actor/minimum_stop_accuracy": minimum_stop_accuracy,
+            "actor/minimum_non_stop_macro_accuracy": (
+                minimum_non_stop_macro_accuracy
+            ),
+            "actor/accepted": accepted,
+        }
+    )
+    print(json.dumps({"mode": "warmup-actor-audit", **state}), flush=True)
     save_checkpoint(model, optimizer, args.output_dir, state)
+    if not accepted:
+        raise RuntimeError(
+            "actor audit failed; checkpoint was saved for diagnosis but must not "
+            "be used for critic warmup or PPO"
+        )
     return 0
 
 
@@ -258,6 +387,7 @@ def warmup(args):
     if manifest.get("dataset_role") == "eval":
         raise RuntimeError("evaluation datasets cannot be used for critic warmup")
     checkpoint_state = _checkpoint_state(args.checkpoint)
+    _reject_failed_actor_audit(checkpoint_state)
     schema = manifest.get("schema_version")
     objective_fingerprint = manifest.get("objective_fingerprint")
     if schema in VERSIONED_DATASET_SCHEMAS and not objective_fingerprint:
@@ -297,22 +427,83 @@ def warmup(args):
         state["lagrange_multiplier"] = float(
             checkpoint_state["lagrange_multiplier"]
         )
+    for key in (
+        "actor/accepted",
+        "actor/audit_stop_accuracy",
+        "actor/audit_non_stop_macro_accuracy",
+        "actor/audit_per_class_accuracy",
+    ):
+        if key in checkpoint_state:
+            state[key] = checkpoint_state[key]
+
+    def validate_metadata(metadata):
+        sample_schema = metadata.get("schema_version")
+        valid_schema = (
+            sample_schema in {None, "safe-vln-go2-v1"}
+            if schema == "safe-vln-go2-v1"
+            else sample_schema == schema
+        )
+        if not valid_schema:
+            raise RuntimeError("warmup sample schema does not match manifest")
+        if metadata.get("objective_fingerprint") != objective_fingerprint:
+            raise RuntimeError(
+                "warmup sample objective fingerprint does not match manifest"
+            )
+        return (
+            metadata.get("reward_return") is not None
+            and metadata.get("cost_return") is not None
+            and (
+                bool(metadata.get("reward_critic_eligible", True))
+                or bool(metadata.get("cost_critic_eligible", True))
+            )
+        )
+
+    sampling_strategy = getattr(args, "sampling_strategy", "sequential")
+    sampling_seed = int(getattr(args, "sampling_seed", 20260729))
+    selected_samples = None
+    if sampling_strategy == "balanced-critic":
+        refs = [
+            ref
+            for ref in iter_sample_refs(args.dataset_dir, args.split)
+            if validate_metadata(ref.metadata)
+        ]
+        selected_refs = select_balanced_critic(
+            refs,
+            max_samples=args.max_samples,
+            seed=sampling_seed,
+        )
+        selected_samples = load_sample_refs(selected_refs)
+        state.update(
+            {
+                "sampling_strategy": sampling_strategy,
+                "sampling_seed": sampling_seed,
+                "sampling": sampling_summary(selected_samples),
+            }
+        )
+        print(
+            json.dumps(
+                {
+                    "mode": "warmup-critics-sampling",
+                    "strategy": sampling_strategy,
+                    "seed": sampling_seed,
+                    **state["sampling"],
+                }
+            ),
+            flush=True,
+        )
+    elif sampling_strategy != "sequential":
+        raise ValueError(
+            "warmup-critics supports --sampling-strategy=sequential or "
+            "balanced-critic"
+        )
 
     def validated_samples():
+        if selected_samples is not None:
+            yield from selected_samples
+            return
         for frames, metadata in iter_samples(args.dataset_dir, args.split):
-            sample_schema = metadata.get("schema_version")
-            valid_schema = (
-                sample_schema in {None, "safe-vln-go2-v1"}
-                if schema == "safe-vln-go2-v1"
-                else sample_schema == schema
-            )
-            if not valid_schema:
-                raise RuntimeError("warmup sample schema does not match manifest")
-            if metadata.get("objective_fingerprint") != objective_fingerprint:
-                raise RuntimeError(
-                    "warmup sample objective fingerprint does not match manifest"
-                )
-            yield frames, metadata
+            if validate_metadata(metadata):
+                yield frames, metadata
 
     for epoch in range(args.epochs):
         stats = train_critic_epoch(
@@ -320,7 +511,9 @@ def warmup(args):
             validated_samples(),
             preprocessor,
             optimizer,
-            max_samples=args.max_samples,
+            max_samples=(
+                None if selected_samples is not None else args.max_samples
+            ),
         )
         state.update({"epoch": epoch + 1, **stats})
         print(json.dumps(state), flush=True)
@@ -341,18 +534,10 @@ def _load_on_policy_samples(args):
         "done",
     )
     episodes = defaultdict(list)
-    count = 0
     for frames, metadata in iter_samples(args.rollout_dir, args.split):
         if any(metadata.get(key) is None for key in required):
             continue
         episodes[str(metadata["episode_id"])].append((frames, metadata))
-        count += 1
-        if (
-            args.max_samples
-            and count >= args.max_samples
-            and bool(metadata.get("done", False))
-        ):
-            break
     if not episodes:
         raise RuntimeError("no structured on-policy transitions in rollout dataset")
 
@@ -405,6 +590,23 @@ def _load_on_policy_samples(args):
             samples.append(sample)
     if not samples:
         raise RuntimeError("no actor-eligible complete episodes in rollout dataset")
+    sampling_strategy = getattr(args, "sampling_strategy", "sequential")
+    sampling_seed = int(getattr(args, "sampling_seed", 20260729))
+    if sampling_strategy == "balanced-ppo":
+        samples = select_balanced_ppo(
+            samples,
+            max_samples=args.max_samples,
+            seed=sampling_seed,
+        )
+    elif sampling_strategy == "sequential":
+        if args.max_samples is not None:
+            samples = samples[: args.max_samples]
+    else:
+        raise ValueError(
+            "train supports --sampling-strategy=sequential or balanced-ppo"
+        )
+    if not samples:
+        raise RuntimeError("rollout sampling selected no PPO transitions")
     return samples, episode_costs
 
 
@@ -492,6 +694,7 @@ def train(args):
     if manifest.get("dataset_role") == "eval":
         raise RuntimeError("evaluation datasets cannot be used for PPO training")
     checkpoint_state = _checkpoint_state(args.checkpoint)
+    _reject_failed_actor_audit(checkpoint_state)
     checkpoint_policy_version = checkpoint_state.get("policy_version")
     if (
         checkpoint_policy_version is not None
@@ -542,9 +745,32 @@ def train(args):
     )
     args.rollout_schema = schema
     samples, episode_costs = _load_on_policy_samples(args)
+    expected_episodes = manifest.get("completed_episodes")
+    if (
+        schema == LIVE_SCHEMA_VERSION
+        and expected_episodes is not None
+        and len(episode_costs) != int(expected_episodes)
+    ):
+        raise RuntimeError(
+            "constraint statistic is missing complete rollout episodes: "
+            f"loaded {len(episode_costs)}, manifest has {expected_episodes}"
+        )
     _validate_sample_objective(samples, manifest)
     _validate_rollout_policy_version(samples, args.policy_version)
     _normalize_rollout_advantages(samples)
+    ppo_sampling = sampling_summary(samples)
+    print(
+        json.dumps(
+            {
+                "mode": "ppo-sampling",
+                "strategy": getattr(args, "sampling_strategy", "sequential"),
+                "seed": int(getattr(args, "sampling_seed", 20260729)),
+                "constraint_episodes": len(episode_costs),
+                **ppo_sampling,
+            }
+        ),
+        flush=True,
+    )
     mean_cost = sum(episode_costs.values()) / len(episode_costs)
     lagrange_before = _initial_lagrange_multiplier(args, checkpoint_state)
     lagrange = LagrangeController(
@@ -668,6 +894,12 @@ def train(args):
         "objective_fingerprint": objective_fingerprint,
         "objective_config": objective_config or None,
         "oracle_stop_weight": float(args.oracle_stop_weight),
+        "sampling_strategy": getattr(
+            args, "sampling_strategy", "sequential"
+        ),
+        "sampling_seed": int(getattr(args, "sampling_seed", 20260729)),
+        "sampling": ppo_sampling,
+        "constraint_episode_count": len(episode_costs),
     }
     save_checkpoint(model, optimizer, args.output_dir, state)
     return 0

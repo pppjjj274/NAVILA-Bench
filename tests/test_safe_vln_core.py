@@ -249,3 +249,27 @@ def test_oracle_stop_weight_changes_ce_and_reports_stop_accuracy():
     assert stats["oracle/samples"] == 2
     assert stats["oracle/stop_samples"] == 1
     assert stats["oracle/stop_accuracy"] == 1.0
+
+
+def test_oracle_stop_weight_survives_batch_size_one():
+    def oracle_ce(weight):
+        _, stats = constrained_ppo_loss(
+            new_log_probs=torch.tensor([0.0], requires_grad=True),
+            old_log_probs=torch.tensor([0.0]),
+            reward_advantages=torch.tensor([0.0]),
+            cost_advantages=torch.tensor([0.0]),
+            reward_values=torch.tensor([0.0], requires_grad=True),
+            cost_values=torch.tensor([0.0], requires_grad=True),
+            reward_returns=torch.tensor([0.0]),
+            cost_returns=torch.tensor([0.0]),
+            entropy=torch.tensor([0.0]),
+            lagrange_multiplier=0.0,
+            action_logits=torch.zeros((1, len(ACTIONS)), requires_grad=True),
+            oracle_action_ids=torch.tensor([9]),
+            oracle_mask=torch.tensor([True]),
+            oracle_sample_weights=torch.tensor([weight]),
+            oracle_ce_coef=1.0,
+        )
+        return stats["loss/oracle_ce"]
+
+    assert oracle_ce(5.0) == pytest.approx(5.0 * oracle_ce(1.0))

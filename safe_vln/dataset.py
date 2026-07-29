@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+from dataclasses import dataclass
 from io import BytesIO
 import json
 from pathlib import Path
@@ -14,6 +16,23 @@ import uuid
 from PIL import Image
 
 from .objective import SCHEMA_VERSION, validate_objective_config
+
+
+@dataclass(frozen=True)
+class SafeVLNSampleRef:
+    """Metadata-only reference to one sample in a complete tar shard."""
+
+    shard_path: Path
+    metadata_name: str
+    metadata: dict[str, Any]
+
+    @property
+    def key(self) -> str:
+        return self.metadata_name[:-5]
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return str(self.shard_path), self.metadata_name
 
 
 def _encode_jpeg(frame: Image.Image, quality: int) -> bytes:
@@ -369,6 +388,69 @@ def iter_metadata(dataset_dir: str | Path, split: str = "train") -> Iterator[dic
                     extracted = archive.extractfile(member)
                     if extracted is not None:
                         yield json.loads(extracted.read().decode("utf-8"))
+
+
+def iter_sample_refs(
+    dataset_dir: str | Path,
+    split: str = "train",
+) -> Iterator[SafeVLNSampleRef]:
+    """Yield sample references without decoding their eight RGB frames."""
+
+    for shard_path in _shard_paths(dataset_dir, split):
+        with tarfile.open(shard_path, "r") as archive:
+            for member in archive:
+                if not member.isfile() or not member.name.endswith(".json"):
+                    continue
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    continue
+                yield SafeVLNSampleRef(
+                    shard_path=shard_path,
+                    metadata_name=member.name,
+                    metadata=json.loads(extracted.read().decode("utf-8")),
+                )
+
+
+def load_sample_refs(
+    refs: Sequence[SafeVLNSampleRef],
+) -> list[tuple[list[Image.Image], dict[str, Any]]]:
+    """Decode selected references while opening each tar shard at most once."""
+
+    grouped: dict[Path, list[tuple[int, SafeVLNSampleRef]]] = defaultdict(list)
+    for output_index, ref in enumerate(refs):
+        grouped[ref.shard_path].append((output_index, ref))
+
+    loaded: list[tuple[list[Image.Image], dict[str, Any]] | None] = [
+        None
+    ] * len(refs)
+    for shard_path, shard_refs in grouped.items():
+        with tarfile.open(shard_path, "r") as archive:
+            members = {
+                member.name: member
+                for member in archive.getmembers()
+                if member.isfile()
+            }
+            for output_index, ref in shard_refs:
+                frames: list[Image.Image] = []
+                for frame_index in range(8):
+                    frame_name = f"{ref.key}.{frame_index}.jpg"
+                    member = members.get(frame_name)
+                    if member is None:
+                        raise ValueError(
+                            f"missing {frame_name} in {shard_path}"
+                        )
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        raise ValueError(
+                            f"failed to extract {frame_name} from {shard_path}"
+                        )
+                    with Image.open(BytesIO(extracted.read())) as image:
+                        frames.append(image.convert("RGB").copy())
+                loaded[output_index] = frames, ref.metadata
+
+    if any(sample is None for sample in loaded):
+        raise RuntimeError("failed to decode one or more Safe-VLN samples")
+    return [sample for sample in loaded if sample is not None]
 
 
 def iter_samples(dataset_dir: str | Path, split: str = "train"):

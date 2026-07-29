@@ -45,6 +45,29 @@ def test_rollout_loader_sorts_each_episode_and_computes_two_gaes(monkeypatch):
     assert episode_costs == {"one": 1.0, "two": 0.0}
 
 
+def test_rollout_max_samples_does_not_truncate_constraint_episode_costs(
+    monkeypatch,
+):
+    source = [
+        (None, _transition("one", 0, 1.0, 0.4, True)),
+        (None, _transition("two", 0, 1.0, 0.7, True)),
+    ]
+    monkeypatch.setattr(train, "iter_samples", lambda *args, **kwargs: iter(source))
+    args = SimpleNamespace(
+        rollout_dir="unused",
+        split="train",
+        max_samples=1,
+        gamma=0.5,
+        gae_lambda=1.0,
+        sampling_strategy="sequential",
+    )
+
+    samples, episode_costs = train._load_on_policy_samples(args)
+
+    assert len(samples) == 1
+    assert episode_costs == {"one": pytest.approx(0.4), "two": pytest.approx(0.7)}
+
+
 def test_rollout_advantages_are_normalized_globally():
     samples = [
         (None, {"reward_advantage": 1.0, "cost_advantage": 0.0}),

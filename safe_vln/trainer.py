@@ -82,7 +82,10 @@ def constrained_ppo_loss(
                     or (weights <= 0).any()
                 ):
                     raise ValueError("oracle sample weights must be finite and positive")
-            oracle_loss = (per_sample_loss * weights).sum() / weights.sum()
+            # Divide by sample count, not by the sum of weights. Normalizing by
+            # weights made a STOP weight of 5.0 cancel completely for the
+            # batch-size-one training configuration used on a single A800.
+            oracle_loss = (per_sample_loss * weights).mean()
             stop_mask = targets == 9
             oracle_samples = int(mask.sum().item())
             oracle_stop_samples = int(stop_mask.sum().item())

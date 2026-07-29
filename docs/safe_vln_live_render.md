@@ -198,32 +198,41 @@ python scripts/safe_vln_main.py collect \
   --dataset-dir outputs/safe_live_v4_oracle_500
 ```
 
-Train a fresh LoRA actor with 5× STOP supervision, then warm its new critics:
+Train a fresh LoRA actor on a deterministic 2,000-transition subset. Balanced
+sampling retains all STOP labels, covers all 500 episodes and 61 scenes, and
+then fills the remaining slots across action classes. The post-training audit
+must reach at least 50% STOP accuracy and 40% non-STOP macro accuracy before
+the checkpoint is accepted. Then warm its new critics on a separately
+risk-balanced 2,000-transition subset:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/safe_vln_main.py warmup-actor \
   --model-path $HOME/NaVILA/checkpoints/navila-llama3-8b-8f \
   --dataset-dir outputs/safe_live_v4_oracle_500 \
-  --output-dir checkpoints/safe_vln_v4_actor_bc \
+  --output-dir checkpoints/safe_vln_v4_actor_bc_v2 \
   --training-dtype bfloat16 \
   --actor-lr 1e-6 \
   --oracle-stop-weight 5 \
   --epochs 1 \
-  --mini-batch-size 1 \
-  --max-samples 500
+  --mini-batch-size 4 \
+  --max-samples 2000 \
+  --sampling-strategy balanced-oracle \
+  --sampling-seed 20260729
 
 CUDA_VISIBLE_DEVICES=0 python scripts/safe_vln_main.py warmup-critics \
   --model-path $HOME/NaVILA/checkpoints/navila-llama3-8b-8f \
-  --checkpoint checkpoints/safe_vln_v4_actor_bc \
+  --checkpoint checkpoints/safe_vln_v4_actor_bc_v2 \
   --reset-critics \
   --dataset-dir outputs/safe_live_v4_oracle_500 \
-  --output-dir checkpoints/safe_vln_v4_warm \
+  --output-dir checkpoints/safe_vln_v4_warm_v2 \
   --training-dtype bfloat16 \
   --epochs 1 \
-  --max-samples 500
+  --max-samples 2000 \
+  --sampling-strategy balanced-critic \
+  --sampling-seed 20260729
 ```
 
-Start `vlm_server.py` with `checkpoints/safe_vln_v4_warm` and
+Start `vlm_server.py` with `checkpoints/safe_vln_v4_warm_v2` and
 `--no-safe_deterministic`, collect 500 VLM-policy episodes in
 `--goal-stop-mode=policy`, then run PPO:
 
@@ -244,7 +253,7 @@ python scripts/safe_vln_main.py collect \
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/safe_vln_main.py train \
   --model-path $HOME/NaVILA/checkpoints/navila-llama3-8b-8f \
-  --checkpoint checkpoints/safe_vln_v4_warm \
+  --checkpoint checkpoints/safe_vln_v4_warm_v2 \
   --rollout-dir outputs/safe_live_v4_on_policy_500 \
   --output-dir checkpoints/safe_vln_v4_ppo_v1 \
   --training-dtype bfloat16 \
@@ -254,13 +263,19 @@ CUDA_VISIBLE_DEVICES=0 python scripts/safe_vln_main.py train \
   --mini-batch-size 1 \
   --oracle-ce-coef 0.05 \
   --oracle-stop-weight 5 \
+  --max-samples 2000 \
+  --sampling-strategy balanced-ppo \
+  --sampling-seed 20260729 \
   --policy-version 0
 ```
 
 The PPO command inherits λ from the input checkpoint unless
 `--initial-lagrange-multiplier` is explicitly supplied. It updates λ once per
-rollout batch and prints `lambda_before`, `lambda_after`, mean episode cost,
-cost limit, and constraint excess.
+rollout batch using costs from every complete rollout episode, not only the
+2,000 selected optimization transitions. It prints `lambda_before`,
+`lambda_after`, mean episode cost, cost limit, and constraint excess. STOP
+weighting is normalized by sample count, so the 5× factor remains effective
+even with `--mini-batch-size=1`.
 
 For the fixed 100-ID `val_unseen` list, run two separate output directories:
 one with `--goal-stop-mode=policy`, then the same IDs with
