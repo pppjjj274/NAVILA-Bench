@@ -82,7 +82,7 @@ export PYTHONPATH="$BENCH_ROOT/isaaclab_exts/omni.isaac.vlnce:$BENCH_ROOT/isaacl
     --safe-live-render --vlnce-episode-ids $ORACLE_IDS \
     --vlnce-metadata "$TRAIN_META" --vlnce-gt "$TRAIN_GT" \
     --mp3d-scenes-root "$MP3D_ROOT" --render-host 127.0.0.1 \
-    --render-port 54322 --dataset-role train --collection-policy oracle \
+    --render-port 54322 --render-timeout-seconds 120 --dataset-role train --collection-policy oracle \
     --goal-stop-mode policy --safe-cost-profile "$COST_PROFILE" \
     --dataset-dir "$DATASET_DIR" 2>&1 | tee "$LOG_ROOT/collection.log"
 
