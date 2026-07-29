@@ -69,6 +69,10 @@ printf '%s\n' "$ORACLE_IDS" >"$LOG_ROOT/episode_ids.txt"
 export CONDA_PREFIX="$ISAAC_ENV"
 export GLIBC_ROOT GLIBC_LOADER GLIBC_LIB
 export GIT_PYTHON_REFRESH=quiet OMNI_KIT_ACCEPT_EULA=YES PYTHONUNBUFFERED=1
+export http_proxy=${http_proxy:-http://login04:3128}
+export https_proxy=${https_proxy:-http://login04:3128}
+export HTTP_PROXY=${HTTP_PROXY:-$http_proxy}
+export HTTPS_PROXY=${HTTPS_PROXY:-$https_proxy}
 export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
 export PYTHONPATH="$BENCH_ROOT/isaaclab_exts/omni.isaac.vlnce:$BENCH_ROOT/isaaclab_exts/omni.isaac.matterport:$ISAACLAB_ROOT/source/extensions/omni.isaac.lab:$ISAACLAB_ROOT/source/extensions/omni.isaac.lab_tasks:$ISAACLAB_ROOT/source/extensions/omni.isaac.lab_assets:$BENCH_ROOT"
 
