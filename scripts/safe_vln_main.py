@@ -494,7 +494,22 @@ def parse_args():
         default="bfloat16",
     )
     actor_warmup.add_argument("--split", default="train")
+    actor_warmup.add_argument(
+        "--actor-architecture",
+        choices=("hierarchical-stop-motion", "candidate-scoring"),
+        default="hierarchical-stop-motion",
+    )
     actor_warmup.add_argument("--actor-lr", type=float, default=1e-6)
+    actor_warmup.add_argument("--head-lr", type=float, default=1e-4)
+    actor_warmup.add_argument("--head-warmup-lr", type=float, default=3e-4)
+    actor_warmup.add_argument("--head-warmup-epochs", type=int, default=20)
+    actor_warmup.add_argument("--head-batch-size", type=int, default=256)
+    actor_warmup.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    actor_warmup.add_argument("--max-grad-norm", type=float, default=0.5)
+    actor_warmup.add_argument("--stop-fraction", type=float, default=0.25)
+    actor_warmup.add_argument("--stop-threshold", type=float, default=0.5)
+    actor_warmup.add_argument("--dev-episodes-per-scene", type=int, default=1)
+    actor_warmup.add_argument("--allow-small-dataset", action="store_true")
     actor_warmup.add_argument("--epochs", type=int, default=1)
     actor_warmup.add_argument("--mini-batch-size", type=int, default=1)
     actor_warmup.add_argument("--max-samples", type=int)
@@ -509,6 +524,11 @@ def parse_args():
         "--minimum-stop-accuracy",
         type=float,
         default=0.5,
+    )
+    actor_warmup.add_argument(
+        "--maximum-false-stop-rate",
+        type=float,
+        default=0.05,
     )
     actor_warmup.add_argument(
         "--minimum-non-stop-macro-accuracy",

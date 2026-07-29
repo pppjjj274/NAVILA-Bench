@@ -17,6 +17,7 @@ from safe_vln.live_render import (
     navigation_alignment_error,
     quantize_dynamic_oracle,
     recv_json_message,
+    sample_navila_history,
     send_json_message,
 )
 from scripts.habitat_render_server import _install_numpy_legacy_aliases
@@ -134,3 +135,42 @@ def test_render_client_verifies_png_integrity(monkeypatch):
     response["image_sha256"] = "0" * 64
     with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
         client.render({})
+
+
+@pytest.mark.parametrize(
+    ("length", "expected"),
+    [
+        (1, ["pad"] * 7 + [0]),
+        (7, ["pad", 0, 1, 2, 3, 4, 5, 6]),
+        (8, list(range(8))),
+        (20, [0, 2, 5, 8, 10, 13, 16, 19]),
+    ],
+)
+def test_navila_full_history_sampling_matches_official_policy(length, expected):
+    sampled = sample_navila_history(
+        list(range(length)), padding_factory=lambda: "pad"
+    )
+    assert sampled == expected
+
+
+def test_dynamic_oracle_quantizes_distance_outside_success_radius():
+    assert quantize_dynamic_oracle(
+        geodesic_distance=3.0,
+        relative_bearing_radians=None,
+    ) == 9
+    assert quantize_dynamic_oracle(
+        geodesic_distance=3.49,
+        relative_bearing_radians=0.0,
+    ) == 6
+    assert quantize_dynamic_oracle(
+        geodesic_distance=3.50,
+        relative_bearing_radians=0.0,
+    ) == 7
+    assert quantize_dynamic_oracle(
+        geodesic_distance=3.749,
+        relative_bearing_radians=0.0,
+    ) == 7
+    assert quantize_dynamic_oracle(
+        geodesic_distance=3.75,
+        relative_bearing_radians=0.0,
+    ) == 8

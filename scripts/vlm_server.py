@@ -32,7 +32,11 @@ from llava.conversation import SeparatorStyle, conv_templates
 # 中文注释: 导入 NaVILA/LLaVA 的模型加载函数，用 checkpoint 路径创建 tokenizer、模型和 image_processor。
 from llava.model.builder import load_pretrained_model
 from safe_vln.actions import action_from_id
-from safe_vln.model import SafeNavilaActorCritic
+from safe_vln.live_render import LIVE_SCHEMA_VERSION
+from safe_vln.model import (
+    ACTOR_ARCHITECTURE_CANDIDATE,
+    SafeNavilaActorCritic,
+)
 
 
 # 中文注释: 定义 VLMServer 类；它负责加载 NaVILA 模型，并通过 TCP 接收图像+指令后返回动作文本。
@@ -69,7 +73,22 @@ class VLMServer:
         adapter_config = os.path.join(checkpoint_path, "adapter_config.json")
         if os.path.exists(adapter_config):
             self.model = PeftModel.from_pretrained(self.model, checkpoint_path)
-        self.safe_model = SafeNavilaActorCritic(self.model, self.tokenizer).to(self.args.device)
+        actor_config_path = os.path.join(checkpoint_path, "actor_config.json")
+        actor_config = {}
+        if os.path.exists(actor_config_path):
+            with open(actor_config_path, "r", encoding="utf-8") as config_file:
+                actor_config = json.load(config_file)
+        self.safe_model = SafeNavilaActorCritic(
+            self.model,
+            self.tokenizer,
+            actor_architecture=actor_config.get(
+                "architecture", ACTOR_ARCHITECTURE_CANDIDATE
+            ),
+            stop_threshold=float(actor_config.get("stop_threshold", 0.5)),
+        ).to(self.args.device)
+        self.safe_model.load_actor_head(
+            checkpoint_path, map_location=self.args.device
+        )
         self.safe_model.load_safe_heads(checkpoint_path, map_location=self.args.device)
         self.safe_model.eval()
         trainer_state_path = os.path.join(checkpoint_path, "trainer_state.json")
@@ -316,7 +335,7 @@ class VLMServer:
                 )
             action = action_from_id(safe_output["action_id"])
             return {
-                "protocol_version": "safe-vln-go2-v2",
+                "protocol_version": LIVE_SCHEMA_VERSION,
                 **safe_output,
                 "policy_version": self.safe_policy_version,
                 "objective_fingerprint": self.safe_objective_fingerprint,

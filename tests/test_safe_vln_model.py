@@ -1,9 +1,15 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from safe_vln.actions import ACTIONS
-from safe_vln.model import SafeNavilaActorCritic
+from safe_vln.model import (
+    ACTOR_ARCHITECTURE_HIERARCHICAL,
+    HierarchicalActorHead,
+    SafeActorCriticOutput,
+    SafeNavilaActorCritic,
+)
 
 
 class _Tokenizer:
@@ -118,3 +124,80 @@ def test_actor_bypasses_navila_supervised_loss_forward():
     assert base_model.prepared == len(ACTIONS)
     assert base_model.encoded == 1
     assert base_model.llm.model.calls == len(ACTIONS)
+
+
+def test_hierarchical_joint_probabilities_are_normalized():
+    stop_logits = torch.tensor([torch.logit(torch.tensor(0.8))])
+    motion_logits = torch.tensor([[2.0] + [0.0] * 8])
+    log_probs = HierarchicalActorHead.joint_log_probs(
+        stop_logits, motion_logits
+    )
+    probabilities = log_probs.exp()
+    assert probabilities.shape == (1, 10)
+    assert probabilities.sum().item() == pytest.approx(1.0)
+    assert probabilities[0, 9].item() == pytest.approx(0.8)
+    assert probabilities[0, :9].sum().item() == pytest.approx(0.2)
+
+
+def test_hierarchical_actor_uses_one_multimodal_forward():
+    base_model = _NaVILAOuterModel()
+    model = SafeNavilaActorCritic(
+        base_model,
+        _Tokenizer(),
+        actor_architecture=ACTOR_ARCHITECTURE_HIERARCHICAL,
+    )
+    output = model(torch.tensor([[2, -200, 3]]), images=[torch.zeros(1)])
+
+    assert output.action_logits.shape == (1, len(ACTIONS))
+    assert output.stop_logits.shape == (1,)
+    assert output.motion_logits.shape == (1, 9)
+    assert base_model.prepared == 1
+    assert base_model.encoded == 1
+    assert base_model.llm.model.calls == 1
+
+
+def test_hierarchical_deterministic_stop_threshold():
+    model = SafeNavilaActorCritic(
+        _ExpandedPrefixModel(),
+        _Tokenizer(),
+        actor_architecture=ACTOR_ARCHITECTURE_HIERARCHICAL,
+        stop_threshold=0.5,
+    )
+
+    def fixed_forward(*args, **kwargs):
+        stop_logits = torch.tensor([0.0])
+        motion_logits = torch.tensor([[0.0, 3.0] + [0.0] * 7])
+        return SafeActorCriticOutput(
+            action_logits=HierarchicalActorHead.joint_log_probs(
+                stop_logits, motion_logits
+            ),
+            reward_values=torch.tensor([1.0]),
+            cost_values=torch.tensor([2.0]),
+            stop_logits=stop_logits,
+            motion_logits=motion_logits,
+        )
+
+    model.forward = fixed_forward
+    result = model.act(torch.tensor([[1]]), deterministic=True)
+    assert result["action_id"] == 9
+    assert len(result["action_probabilities"]) == 10
+    assert sum(result["action_probabilities"]) == pytest.approx(1.0)
+
+
+def test_hierarchical_checkpoint_saves_actor_contract(tmp_path):
+    model = SafeNavilaActorCritic(
+        _ExpandedPrefixModel(),
+        _Tokenizer(),
+        actor_architecture=ACTOR_ARCHITECTURE_HIERARCHICAL,
+    )
+    model.save_safe_heads(tmp_path)
+    assert (tmp_path / "actor_head.pt").is_file()
+    assert (tmp_path / "actor_config.json").is_file()
+
+    restored = SafeNavilaActorCritic(
+        _ExpandedPrefixModel(),
+        _Tokenizer(),
+        actor_architecture=ACTOR_ARCHITECTURE_HIERARCHICAL,
+    )
+    restored.load_actor_head(tmp_path)
+    restored.load_safe_heads(tmp_path)

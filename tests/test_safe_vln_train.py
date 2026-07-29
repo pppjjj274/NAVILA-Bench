@@ -223,3 +223,22 @@ def test_lagrange_inherits_checkpoint_unless_explicitly_overridden():
     assert train._initial_lagrange_multiplier(
         explicit, {"lagrange_multiplier": 0.7}
     ) == pytest.approx(0.2)
+
+
+def test_actor_audit_contract_is_preserved_between_training_stages():
+    source = {
+        "actor/accepted": True,
+        "actor/audit_stop_recall": 0.7,
+        "actor/audit_false_stop_rate_non_goal": 0.03,
+        "actor_architecture": "hierarchical-stop-motion",
+        "stop_threshold": 0.5,
+        "unrelated": "discard",
+    }
+    target = {"mode": "next-stage"}
+    train._copy_actor_contract(target, source)
+    assert target["actor/accepted"] is True
+    assert target["actor/audit_stop_recall"] == pytest.approx(0.7)
+    assert target["actor/audit_false_stop_rate_non_goal"] == pytest.approx(0.03)
+    assert target["actor_architecture"] == "hierarchical-stop-motion"
+    assert target["stop_threshold"] == pytest.approx(0.5)
+    assert "unrelated" not in target

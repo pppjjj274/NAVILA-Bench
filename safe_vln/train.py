@@ -61,6 +61,15 @@ def _reject_failed_actor_audit(checkpoint_state):
         )
 
 
+def _copy_actor_contract(target, checkpoint_state):
+    for key, value in checkpoint_state.items():
+        if key.startswith("actor/") or key in {
+            "actor_architecture",
+            "stop_threshold",
+        }:
+            target[key] = value
+
+
 def _validate_objective_compatibility(manifest, checkpoint_state):
     schema = manifest.get("schema_version")
     dataset_fingerprint = manifest.get("objective_fingerprint")
@@ -101,6 +110,12 @@ def _training_dtype(args):
 
 def _optimizer(model, actor_lr, critic_lr):
     actor = [parameter for parameter in model.base_model.parameters() if parameter.requires_grad]
+    if getattr(model, "actor_head", None) is not None:
+        actor.extend(
+            parameter
+            for parameter in model.actor_head.parameters()
+            if parameter.requires_grad
+        )
     critics = list(model.reward_head.parameters()) + list(model.cost_head.parameters())
     groups = []
     if actor:
@@ -132,8 +147,8 @@ def _initial_lagrange_multiplier(args, checkpoint_state):
     return value
 
 
-def warmup_actor(args):
-    """Fresh-LoRA behavior cloning on strictly aligned dynamic-oracle samples."""
+def _warmup_actor_candidate(args):
+    """Legacy candidate-scoring behavior cloning on strictly aligned dynamic-oracle samples."""
     if getattr(args, "checkpoint", None):
         raise ValueError("warmup-actor starts from fresh NaViLA LoRA; omit --checkpoint")
     if args.actor_lr <= 0:
@@ -380,6 +395,31 @@ def warmup_actor(args):
     return 0
 
 
+def warmup_actor(args):
+    """Train either the v5 hierarchical actor or a legacy candidate actor."""
+    architecture = getattr(
+        args, "actor_architecture", "hierarchical-stop-motion"
+    )
+    if architecture == "candidate-scoring":
+        return _warmup_actor_candidate(args)
+    if architecture != "hierarchical-stop-motion":
+        raise ValueError(f"unsupported actor architecture: {architecture}")
+    manifest = _dataset_manifest(args.dataset_dir)
+    if manifest.get("dataset_role") != "train":
+        raise RuntimeError("actor warmup requires a training dataset")
+    if manifest.get("schema_version") != LIVE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"hierarchical actor requires {LIVE_SCHEMA_VERSION} data"
+        )
+    if not manifest.get("objective_fingerprint"):
+        raise RuntimeError("actor warmup dataset has no objective fingerprint")
+    from .actor_pipeline import warmup_hierarchical_actor
+
+    return warmup_hierarchical_actor(
+        args, manifest, _training_dtype(args)
+    )
+
+
 def warmup(args):
     if getattr(args, "reset_critics", False) and not args.checkpoint:
         raise ValueError("--reset-critics requires --checkpoint")
@@ -427,14 +467,7 @@ def warmup(args):
         state["lagrange_multiplier"] = float(
             checkpoint_state["lagrange_multiplier"]
         )
-    for key in (
-        "actor/accepted",
-        "actor/audit_stop_accuracy",
-        "actor/audit_non_stop_macro_accuracy",
-        "actor/audit_per_class_accuracy",
-    ):
-        if key in checkpoint_state:
-            state[key] = checkpoint_state[key]
+    _copy_actor_contract(state, checkpoint_state)
 
     def validate_metadata(metadata):
         sample_schema = metadata.get("schema_version")
@@ -901,5 +934,6 @@ def train(args):
         "sampling": ppo_sampling,
         "constraint_episode_count": len(episode_costs),
     }
+    _copy_actor_contract(state, checkpoint_state)
     save_checkpoint(model, optimizer, args.output_dir, state)
     return 0

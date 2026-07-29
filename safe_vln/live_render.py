@@ -20,13 +20,44 @@ from PIL import Image
 from .actions import action_from_id
 
 
-LIVE_SCHEMA_VERSION = "safe-vln-go2-v4"
-LEGACY_LIVE_SCHEMA_VERSIONS = frozenset({"safe-vln-go2-v3"})
+LIVE_SCHEMA_VERSION = "safe-vln-go2-v5"
+LEGACY_LIVE_SCHEMA_VERSIONS = frozenset(
+    {"safe-vln-go2-v3", "safe-vln-go2-v4"}
+)
 LIVE_RENDER_PROTOCOL = "safe-vln-habitat-render-v2"
 DEFAULT_RENDER_PORT = 54322
 DEFAULT_RENDER_TIMEOUT_SECONDS = 10.0
 DEFAULT_GO2_BASE_HEIGHT_M = 0.4
 MAX_RENDER_MESSAGE_BYTES = 32 * 1024 * 1024
+NAVILA_VIDEO_FRAMES = 8
+NAVILA_HISTORY_SAMPLING_POLICY = "navila_uniform_full_history_v1"
+
+
+def sample_navila_history(
+    history: Sequence[Any],
+    *,
+    num_frames: int = NAVILA_VIDEO_FRAMES,
+    padding_factory=None,
+) -> list[Any]:
+    """Match NaViLA official full-history sampling exactly."""
+    if num_frames < 2:
+        raise ValueError("NaViLA history sampling requires at least two frames")
+    if not history:
+        raise ValueError("NaViLA history cannot be empty")
+    items = list(history)
+    missing = num_frames - len(items)
+    if missing > 0:
+        if padding_factory is None:
+            raise ValueError("short NaViLA histories require a padding factory")
+        items = [padding_factory() for _ in range(missing)] + items
+    last_index = len(items) - 1
+    uniform_count = num_frames - 1
+    indices = [
+        (index * last_index) // uniform_count
+        for index in range(uniform_count)
+    ]
+    return [items[index] for index in indices] + [items[-1]]
+
 
 
 def wrap_angle_radians(value: float) -> float:
@@ -141,7 +172,12 @@ def quantize_dynamic_oracle(
         magnitude = min(45, max(15, int(round(abs(math.degrees(bearing)) / 15.0)) * 15))
         index = {15: 0, 30: 1, 45: 2}[magnitude]
         return index if bearing > 0 else index + 3
-    safe_forward = min(max(0.0, float(forward_distance_m)), distance)
+    # Quantize only the distance that remains outside the success region.
+    remaining_distance = max(0.0, distance - float(success_distance_m))
+    safe_forward = min(
+        max(0.0, float(forward_distance_m)),
+        remaining_distance,
+    )
     if safe_forward >= 0.75:
         return 8
     if safe_forward >= 0.50:

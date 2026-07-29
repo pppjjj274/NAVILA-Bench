@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +19,8 @@ class SafeActorCriticOutput:
     action_logits: torch.Tensor
     reward_values: torch.Tensor
     cost_values: torch.Tensor
+    stop_logits: torch.Tensor | None = None
+    motion_logits: torch.Tensor | None = None
 
     @property
     def distribution(self):
@@ -39,6 +42,43 @@ class ValueHead(nn.Module):
         return self.network(hidden_state).squeeze(-1).float()
 
 
+ACTOR_ARCHITECTURE_CANDIDATE = "candidate-scoring"
+ACTOR_ARCHITECTURE_HIERARCHICAL = "hierarchical-stop-motion"
+
+
+class HierarchicalActorHead(nn.Module):
+    """Factor ten actions into STOP probability and conditional motion."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int = 512) -> None:
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, intermediate_size),
+            nn.GELU(),
+        )
+        self.stop_head = nn.Linear(intermediate_size, 1)
+        self.motion_head = nn.Linear(intermediate_size, 9)
+
+    def forward(self, hidden_state: torch.Tensor):
+        parameters = next(self.parameters())
+        hidden_state = hidden_state.to(
+            device=parameters.device, dtype=parameters.dtype
+        )
+        feature = self.projection(hidden_state)
+        return self.stop_head(feature).squeeze(-1), self.motion_head(feature)
+
+    @staticmethod
+    def joint_log_probs(stop_logits, motion_logits):
+        log_stop = -torch.nn.functional.softplus(-stop_logits)
+        log_continue = -torch.nn.functional.softplus(stop_logits)
+        motion = torch.log_softmax(motion_logits.float(), dim=-1)
+        return torch.cat(
+            (log_continue.float().unsqueeze(-1) + motion,
+             log_stop.float().unsqueeze(-1)),
+            dim=-1,
+        )
+
+
 class SafeNavilaActorCritic(nn.Module):
     """Score canonical response sequences and predict reward/cost values.
 
@@ -49,10 +89,27 @@ class SafeNavilaActorCritic(nn.Module):
     to the end of the expanded sequence rather than the text prompt length.
     """
 
-    def __init__(self, base_model: nn.Module, tokenizer: Any, hidden_size: int | None = None) -> None:
+    def __init__(
+        self,
+        base_model: nn.Module,
+        tokenizer: Any,
+        hidden_size: int | None = None,
+        *,
+        actor_architecture: str = ACTOR_ARCHITECTURE_CANDIDATE,
+        stop_threshold: float = 0.5,
+    ) -> None:
         super().__init__()
+        if actor_architecture not in {
+            ACTOR_ARCHITECTURE_CANDIDATE,
+            ACTOR_ARCHITECTURE_HIERARCHICAL,
+        }:
+            raise ValueError(f"unsupported actor architecture: {actor_architecture}")
+        if not 0.0 < float(stop_threshold) < 1.0:
+            raise ValueError("stop threshold must be in (0, 1)")
         self.base_model = base_model
         self.tokenizer = tokenizer
+        self.actor_architecture = actor_architecture
+        self.stop_threshold = float(stop_threshold)
         if hidden_size is None:
             config = base_model.config
             hidden_size = getattr(config, "hidden_size", None)
@@ -62,6 +119,11 @@ class SafeNavilaActorCritic(nn.Module):
                 raise ValueError("could not infer NaViLA hidden size")
         self.reward_head = ValueHead(int(hidden_size))
         self.cost_head = ValueHead(int(hidden_size))
+        self.actor_head = (
+            HierarchicalActorHead(int(hidden_size))
+            if actor_architecture == ACTOR_ARCHITECTURE_HIERARCHICAL
+            else None
+        )
         self._candidate_ids = [
             tokenizer(text, add_special_tokens=False, return_tensors="pt").input_ids[0]
             for text in NAVILA_ACTION_RESPONSES
@@ -106,6 +168,7 @@ class SafeNavilaActorCritic(nn.Module):
         images=None,
         image_features=None,
         output_suffix_length=None,
+        project_logits=True,
         **model_kwargs,
     ):
         # NaViLA's outer LlavaLlamaModel.forward is coupled to its original
@@ -166,7 +229,11 @@ class SafeNavilaActorCritic(nn.Module):
                 suffix_hidden = backbone_output.last_hidden_state[
                     :, -output_suffix_length:
                 ]
-                suffix_logits = navila_model.llm.lm_head(suffix_hidden).float()
+                suffix_logits = (
+                    navila_model.llm.lm_head(suffix_hidden).float()
+                    if project_logits
+                    else None
+                )
                 return SimpleNamespace(
                     logits=suffix_logits,
                     hidden_states=(suffix_hidden,),
@@ -190,7 +257,7 @@ class SafeNavilaActorCritic(nn.Module):
             **model_kwargs,
         )
 
-    def forward(self, prompt_input_ids: torch.Tensor, images=None, **model_kwargs) -> SafeActorCriticOutput:
+    def _forward_candidate(self, prompt_input_ids, images=None, **model_kwargs):
         if prompt_input_ids.ndim != 2 or prompt_input_ids.shape[0] != 1:
             raise ValueError("candidate scoring currently expects one prompt per forward call")
         prompt_input_ids = prompt_input_ids.to(next(self.base_model.parameters()).device)
@@ -225,10 +292,61 @@ class SafeNavilaActorCritic(nn.Module):
             cost_values=self.cost_head(state_hidden),
         )
 
+    def encode_state(self, prompt_input_ids, images=None, **model_kwargs):
+        if prompt_input_ids.ndim != 2 or prompt_input_ids.shape[0] != 1:
+            raise ValueError("Safe-VLN expects one prompt per forward call")
+        prompt_input_ids = prompt_input_ids.to(
+            next(self.base_model.parameters()).device
+        )
+        output = self._forward_base(
+            prompt_input_ids,
+            torch.ones_like(prompt_input_ids),
+            images=images,
+            output_suffix_length=1,
+            project_logits=False,
+            **model_kwargs,
+        )
+        return output.hidden_states[-1][:, -1]
+
+    def _forward_hierarchical(self, prompt_input_ids, images=None, **model_kwargs):
+        if self.actor_head is None:
+            raise RuntimeError("hierarchical actor head is not initialized")
+        state_hidden = self.encode_state(
+            prompt_input_ids, images=images, **model_kwargs
+        )
+        stop_logits, motion_logits = self.actor_head(state_hidden)
+        return SafeActorCriticOutput(
+            action_logits=self.actor_head.joint_log_probs(
+                stop_logits, motion_logits
+            ),
+            reward_values=self.reward_head(state_hidden),
+            cost_values=self.cost_head(state_hidden),
+            stop_logits=stop_logits,
+            motion_logits=motion_logits,
+        )
+
+    def forward(self, prompt_input_ids, images=None, **model_kwargs):
+        if self.actor_architecture == ACTOR_ARCHITECTURE_HIERARCHICAL:
+            return self._forward_hierarchical(
+                prompt_input_ids, images=images, **model_kwargs
+            )
+        return self._forward_candidate(
+            prompt_input_ids, images=images, **model_kwargs
+        )
+
     def act(self, prompt_input_ids, images=None, deterministic: bool = False, **model_kwargs):
         output = self.forward(prompt_input_ids, images=images, **model_kwargs)
         distribution = output.distribution
-        action = output.action_logits.argmax(dim=-1) if deterministic else distribution.sample()
+        if deterministic and output.stop_logits is not None:
+            stop = torch.sigmoid(output.stop_logits) >= self.stop_threshold
+            motion = output.motion_logits.argmax(dim=-1)
+            action = torch.where(stop, torch.full_like(motion, 9), motion)
+        else:
+            action = (
+                output.action_logits.argmax(dim=-1)
+                if deterministic
+                else distribution.sample()
+            )
         return {
             "action_id": int(action.item()),
             "log_prob": float(distribution.log_prob(action).item()),
@@ -242,6 +360,18 @@ class SafeNavilaActorCritic(nn.Module):
         output_dir.mkdir(parents=True, exist_ok=True)
         torch.save(self.reward_head.state_dict(), output_dir / "reward_critic.pt")
         torch.save(self.cost_head.state_dict(), output_dir / "cost_critic.pt")
+        if self.actor_head is not None:
+            torch.save(self.actor_head.state_dict(), output_dir / "actor_head.pt")
+        (output_dir / "actor_config.json").write_text(
+            json.dumps(
+                {
+                    "architecture": self.actor_architecture,
+                    "stop_threshold": self.stop_threshold,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     def load_safe_heads(self, checkpoint_dir: str | Path, map_location="cpu") -> None:
         checkpoint_dir = Path(checkpoint_dir)
@@ -249,6 +379,16 @@ class SafeNavilaActorCritic(nn.Module):
         cost_state = torch.load(checkpoint_dir / "cost_critic.pt", map_location=map_location)
         self.reward_head.load_state_dict(reward_state)
         self.cost_head.load_state_dict(cost_state)
+
+    def load_actor_head(self, checkpoint_dir: str | Path, map_location="cpu"):
+        if self.actor_head is None:
+            return
+        path = Path(checkpoint_dir) / "actor_head.pt"
+        if not path.is_file():
+            raise RuntimeError(
+                "hierarchical checkpoint is missing actor_head.pt"
+            )
+        self.actor_head.load_state_dict(torch.load(path, map_location=map_location))
 
 
 def add_lora_adapters(model: nn.Module, *, rank: int = 16, alpha: int = 32, dropout: float = 0.05):

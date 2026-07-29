@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 from typing import Sequence
 
 import torch
@@ -60,11 +62,44 @@ def load_safe_navila(
     add_lora: bool = True,
     checkpoint: str | None = None,
     reset_critics: bool = False,
+    actor_architecture: str | None = None,
+    stop_threshold: float | None = None,
 ):
     from llava.mm_utils import get_model_name_from_path
     from llava.model.builder import load_pretrained_model
 
-    from .model import SafeNavilaActorCritic, add_lora_adapters
+    from .model import (
+        ACTOR_ARCHITECTURE_CANDIDATE,
+        SafeNavilaActorCritic,
+        add_lora_adapters,
+    )
+
+    actor_config = {}
+    if checkpoint:
+        actor_config_path = Path(checkpoint) / "actor_config.json"
+        if actor_config_path.is_file():
+            actor_config = json.loads(
+                actor_config_path.read_text(encoding="utf-8")
+            )
+    checkpoint_architecture = actor_config.get("architecture")
+    if (
+        actor_architecture is not None
+        and checkpoint_architecture is not None
+        and actor_architecture != checkpoint_architecture
+    ):
+        raise RuntimeError(
+            "requested actor architecture does not match checkpoint"
+        )
+    resolved_architecture = (
+        actor_architecture
+        or checkpoint_architecture
+        or ACTOR_ARCHITECTURE_CANDIDATE
+    )
+    resolved_stop_threshold = float(
+        stop_threshold
+        if stop_threshold is not None
+        else actor_config.get("stop_threshold", 0.5)
+    )
 
     model_name = get_model_name_from_path(model_path)
     tokenizer, base_model, image_processor, _ = load_pretrained_model(model_path, model_name, None)
@@ -79,9 +114,16 @@ def load_safe_navila(
     # overflowed on A800 after the first PPO update; BF16 preserves the same
     # memory footprint while providing the exponent range needed for training.
     base_model = base_model.to(device=device, dtype=dtype)
-    safe_model = SafeNavilaActorCritic(base_model, tokenizer).to(device)
-    if checkpoint and not reset_critics:
-        safe_model.load_safe_heads(checkpoint, map_location=device)
+    safe_model = SafeNavilaActorCritic(
+        base_model,
+        tokenizer,
+        actor_architecture=resolved_architecture,
+        stop_threshold=resolved_stop_threshold,
+    ).to(device)
+    if checkpoint:
+        safe_model.load_actor_head(checkpoint, map_location=device)
+        if not reset_critics:
+            safe_model.load_safe_heads(checkpoint, map_location=device)
     preprocessor = NavilaStatePreprocessor(
         tokenizer,
         image_processor,

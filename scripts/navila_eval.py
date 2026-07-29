@@ -40,11 +40,14 @@ from safe_vln.live_render import (
     DEFAULT_RENDER_TIMEOUT_SECONDS,
     HabitatRenderClient,
     LIVE_SCHEMA_VERSION,
+    NAVILA_HISTORY_SAMPLING_POLICY,
+    NAVILA_VIDEO_FRAMES,
     habitat_yaw_to_isaac_yaw,
     isaac_position_to_habitat,
     isaac_wxyz_to_yaw,
     isaac_yaw_to_habitat_yaw,
     navigation_alignment_error,
+    sample_navila_history,
 )
 
 # isaaclab argparse arguments
@@ -556,10 +559,24 @@ def _robot_pose(env):
 def _sample_live_history(history):
     if not history:
         raise RuntimeError("strict live-render history is empty")
-    selected = list(history[-8:])
-    if len(selected) < 8:
-        selected = [selected[0]] * (8 - len(selected)) + selected
-    return selected
+    width, height = history[-1]["image"].size
+
+    def black_padding():
+        return {
+            "image": Image.new("RGB", (width, height), (0, 0, 0)),
+            "metadata": {
+                "history_padding": True,
+                "padding_policy": "black_left",
+                "strict_observation_state_alignment": False,
+                "physics_step": None,
+            },
+        }
+
+    return sample_navila_history(
+        history,
+        num_frames=NAVILA_VIDEO_FRAMES,
+        padding_factory=black_padding,
+    )
 
 
 def _render_live_frame(
@@ -687,6 +704,9 @@ def _live_output_metadata(vlnce_metadata, *, policy_version):
         "strict_observation_state_alignment": True,
         "alignment_scope": "navigation_pose_xy_yaw",
         "camera_pose_policy": "navila_upright_1.25m",
+        "history_sampling_policy": NAVILA_HISTORY_SAMPLING_POLICY,
+        "history_padding_policy": "black_left",
+        "history_num_frames": NAVILA_VIDEO_FRAMES,
         "physical_episode_source": "original_vlnce_episode",
         "reward_source": "live_habitat_geodesic_progress",
         "navmesh_source": "locally_recomputed_habitat_sim_0.1.7",
@@ -809,6 +829,9 @@ def run_safe_live_render_episode(
                         "scene_id": vlnce_metadata.scene_name,
                         "transition_index": len(recorder.transitions),
                         "strict_observation_state_alignment": True,
+                        "history_sampling_policy": (
+                            NAVILA_HISTORY_SAMPLING_POLICY
+                        ),
                         "deterministic": True,
                     },
                 )
@@ -954,6 +977,11 @@ def run_safe_live_render_episode(
                     "observation_alignment": "live_habitat_from_go2_pose",
                     "alignment_scope": "navigation_pose_xy_yaw",
                     "camera_pose_policy": "navila_upright_1.25m",
+                    "history_sampling_policy": (
+                        NAVILA_HISTORY_SAMPLING_POLICY
+                    ),
+                    "history_padding_policy": "black_left",
+                    "history_num_frames": NAVILA_VIDEO_FRAMES,
                     "strict_observation_state_alignment": True,
                     "navigation_reward_valid": navigation_reward_valid,
                     "policy_statistics_valid": policy_statistics_valid,

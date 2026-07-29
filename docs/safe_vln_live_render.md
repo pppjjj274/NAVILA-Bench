@@ -306,3 +306,61 @@ python scripts/safe_vln_main.py evaluate \
   --safe-cost-profile checkpoints/safe_vln_v4_cost_profile.json \
   --dataset-dir outputs/safe_vln_v4_eval_shield_100
 ```
+
+## Safe-VLN v5 hierarchical actor
+
+v5 is a new data contract. Existing v4 shards and checkpoints are legacy
+read-only inputs and must not be appended to or used for v5 actor warmup. v5
+matches original NaViLA frame preparation: black left-padding for short
+histories, seven uniformly spaced observations over the complete history, then
+the latest observation. Its dynamic Oracle quantizes the distance remaining
+outside the episode success radius, so 25/50/75 cm actions are all supervised.
+
+Run an eight-episode collection smoke test inside an allocated A800 node:
+
+```bash
+EPISODE_COUNT=8 DATASET_DIR=$HOME/NaVILA-Bench/outputs/safe_live_v5_smoke_8 \
+  bash scripts/run_safe_vln_v5_collect_oracle.sh
+```
+
+After inspecting the smoke audit, collect the same deterministic 500 training
+IDs used by v4 (offset 80) into a new directory:
+
+```bash
+bash scripts/run_safe_vln_v5_collect_oracle.sh
+```
+
+The script automatically runs `audit_safe_vln_v5.py`. Formal acceptance
+requires exactly 500 episodes and 61 scenes, unique observation keys, strict
+pose/frame alignment, all ten actions with at least 50 samples each, and at
+least 150 STOP samples. It never appends to an existing v5 directory.
+
+Train the hierarchical actor from the original NaViLA checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/run_safe_vln_v5_warmup_actor.sh
+```
+
+Stage 1 caches one multimodal state feature per scheduled sample and trains only
+the STOP/9-motion head for 20 epochs. Stage 2 unfreezes only the fresh LoRA
+adapter for one epoch. Complete episodes are split before sampling: one episode
+per scene is held out for dev and never used for updates. Batches contain 25%
+STOP samples; the remainder is uniform over the nine motion actions. The
+checkpoint is accepted only when dev STOP recall is at least 0.50, non-goal
+false STOP rate is at most 0.05, non-STOP macro accuracy is at least 0.40, and
+all ten probabilities are finite and normalized.
+
+A 64-transition A800 training smoke can be run against the accepted full v5
+dataset without weakening the full-dataset audit:
+
+```bash
+MAX_SAMPLES=64 \
+OUTPUT_DIR=$HOME/NaVILA-Bench/checkpoints/safe_vln_v5_actor_smoke_64 \
+LOG_ROOT=$HOME/NaVILA-Bench/outputs/safe_vln_v5_actor_smoke_64_logs \
+  bash scripts/run_safe_vln_v5_warmup_actor.sh
+```
+
+New checkpoints contain `actor_head.pt` and `actor_config.json` in addition to
+the LoRA adapter and critic heads. `vlm_server.py` selects this architecture
+automatically; checkpoints without `actor_config.json` retain the legacy
+candidate-response scorer.
