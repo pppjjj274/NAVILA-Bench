@@ -591,6 +591,37 @@ def _render_live_frame(
     before = _robot_pose(env)
     habitat_position = isaac_position_to_habitat(before["position"])
     habitat_yaw = isaac_yaw_to_habitat_yaw(before["yaw"])
+    expected_start_yaw = isaac_yaw_to_habitat_yaw(
+        isaac_wxyz_to_yaw(vlnce_metadata.start_rotation_isaac_wxyz)
+    )
+    start_position_error, start_yaw_error = navigation_alignment_error(
+        before["position"],
+        before["yaw"],
+        vlnce_metadata.start_position_habitat,
+        expected_start_yaw,
+    )
+    if transition_index == 0 and frame_index == 0 and (
+        start_position_error > 0.02
+        or start_yaw_error > math.radians(1.0)
+    ):
+        diagnostic = {
+            "event": "episode_start_alignment_failed",
+            "episode_id": str(vlnce_metadata.episode_id),
+            "scene_id": vlnce_metadata.scene_name,
+            "position_error_m": start_position_error,
+            "yaw_error_rad": start_yaw_error,
+            "isaac_pose": before,
+            "expected_habitat_position": list(
+                vlnce_metadata.start_position_habitat
+            ),
+            "expected_habitat_yaw": expected_start_yaw,
+        }
+        print("[SAFE-LIVE][START-INVALID] " + json.dumps(diagnostic), flush=True)
+        raise RuntimeError(
+            "strict live-render episode start alignment failed: "
+            f"position={start_position_error:.6f}m "
+            f"yaw={math.degrees(start_yaw_error):.4f}deg"
+        )
     request_id = (
         f"{vlnce_metadata.episode_id}-{transition_index}-{frame_index}-"
         f"{uuid.uuid4().hex}"
@@ -676,9 +707,15 @@ def _render_live_frame(
         "yaw_error_rad": yaw_error,
         "physics_paused_position_error_m": paused_position_error,
         "physics_paused_yaw_error_rad": paused_yaw_error,
+        "episode_start_position_error_m": start_position_error,
+        "episode_start_yaw_error_rad": start_yaw_error,
         "strict_observation_state_alignment": True,
         "nearest_navmesh_point": response.get("nearest_navmesh_point"),
         "navmesh_snap_distance": response.get("navmesh_snap_distance"),
+        "start_snap_valid": bool(response.get("start_snap_valid", False)),
+        "goal_snap_valid": bool(response.get("goal_snap_valid", False)),
+        "start_snap_distance_m": response.get("start_snap_distance_m"),
+        "goal_snap_distance_m": response.get("goal_snap_distance_m"),
         "is_navigable": bool(response.get("is_navigable", False)),
         "geodesic_distance": response.get("geodesic_distance"),
         "navigation_reward_valid": bool(
@@ -687,6 +724,7 @@ def _render_live_frame(
         "success_distance_m": float(returned_success_distance),
         "dynamic_oracle_action": response.get("dynamic_oracle_action"),
         "oracle_valid": bool(response.get("oracle_valid", False)),
+        "oracle_invalid_reason": response.get("oracle_invalid_reason"),
         "render_latency_ms": response.get("render_latency_ms"),
         "camera": response.get("camera"),
     }
@@ -807,8 +845,31 @@ def run_safe_live_render_episode(
                     current_frame_metadata.get("oracle_valid", False)
                     and isinstance(oracle, dict)
                 ):
+                    diagnostic = {
+                        "event": "invalid_dynamic_oracle",
+                        "episode_id": str(vlnce_metadata.episode_id),
+                        "scene_id": vlnce_metadata.scene_name,
+                        "transition_index": len(recorder.transitions),
+                        "oracle_invalid_reason": current_frame_metadata.get(
+                            "oracle_invalid_reason"
+                        ),
+                        "start_snap_valid": current_frame_metadata.get("start_snap_valid"),
+                        "goal_snap_valid": current_frame_metadata.get("goal_snap_valid"),
+                        "start_snap_distance_m": current_frame_metadata.get("start_snap_distance_m"),
+                        "goal_snap_distance_m": current_frame_metadata.get("goal_snap_distance_m"),
+                        "geodesic_distance_m": current_frame_metadata.get("geodesic_distance"),
+                        "episode_start_position_error_m": current_frame_metadata.get(
+                            "episode_start_position_error_m"
+                        ),
+                        "episode_start_yaw_error_rad": current_frame_metadata.get(
+                            "episode_start_yaw_error_rad"
+                        ),
+                        "isaac_pose": current_frame_metadata.get("isaac_pose"),
+                    }
+                    print("[SAFE-LIVE][ORACLE-INVALID] " + json.dumps(diagnostic), flush=True)
                     raise RuntimeError(
-                        "oracle collection encountered an invalid dynamic oracle"
+                        "oracle collection encountered an invalid dynamic oracle: "
+                        f"{diagnostic['oracle_invalid_reason']}"
                     )
                 response = {
                     "protocol_version": LIVE_SCHEMA_VERSION,
@@ -1724,7 +1785,8 @@ def main():
                         blocked_seconds=args_cli.safe_blocked_seconds,
                         blocked_distance=args_cli.safe_blocked_distance,
                         cost_profile=safe_cost_profile,
-                        calibration_file=args_cli.safe_calibration_file)
+                        calibration_file=args_cli.safe_calibration_file,
+                        strict_start_alignment=args_cli.safe_live_render)
     
     if not args_cli.safe_replay and not args_cli.safe_live_render:
         # set view pos and target

@@ -149,6 +149,43 @@ def navigation_alignment_error(
     return position_error, yaw_error
 
 
+def navigation_oracle_invalid_reason(
+    *,
+    start_snap_valid: bool,
+    goal_snap_valid: bool,
+    start_snap_distance_m: float | None,
+    goal_snap_distance_m: float | None,
+    geodesic_distance_m: float | None,
+    max_snap_distance_m: float,
+) -> str | None:
+    """Return the fail-closed reason that a navigation oracle is unavailable."""
+    maximum = float(max_snap_distance_m)
+    if not math.isfinite(maximum) or maximum <= 0:
+        raise ValueError("max_snap_distance_m must be finite and positive")
+    if not start_snap_valid:
+        return "start_snap_invalid"
+    if not goal_snap_valid:
+        return "goal_snap_invalid"
+    if (
+        start_snap_distance_m is None
+        or not math.isfinite(float(start_snap_distance_m))
+        or float(start_snap_distance_m) > maximum
+    ):
+        return "start_snap_too_far"
+    if (
+        goal_snap_distance_m is None
+        or not math.isfinite(float(goal_snap_distance_m))
+        or float(goal_snap_distance_m) > maximum
+    ):
+        return "goal_snap_too_far"
+    if (
+        geodesic_distance_m is None
+        or not math.isfinite(float(geodesic_distance_m))
+    ):
+        return "path_unreachable"
+    return None
+
+
 def quantize_dynamic_oracle(
     *,
     geodesic_distance: float,

@@ -15,6 +15,7 @@ from safe_vln.live_render import (
     isaac_wxyz_to_yaw,
     isaac_yaw_to_habitat_yaw,
     navigation_alignment_error,
+    navigation_oracle_invalid_reason,
     quantize_dynamic_oracle,
     recv_json_message,
     sample_navila_history,
@@ -88,6 +89,30 @@ def test_dynamic_oracle_uses_episode_specific_goal_radius():
         relative_bearing_radians=None,
         success_distance_m=3.0,
     ) == 9
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"start_snap_valid": False}, "start_snap_invalid"),
+        ({"goal_snap_valid": False}, "goal_snap_invalid"),
+        ({"start_snap_distance_m": 0.25001}, "start_snap_too_far"),
+        ({"goal_snap_distance_m": 0.25001}, "goal_snap_too_far"),
+        ({"geodesic_distance_m": None}, "path_unreachable"),
+        ({}, None),
+    ],
+)
+def test_navigation_oracle_invalid_reason_is_fail_closed(overrides, expected):
+    values = {
+        "start_snap_valid": True,
+        "goal_snap_valid": True,
+        "start_snap_distance_m": 0.25,
+        "goal_snap_distance_m": 0.25,
+        "geodesic_distance_m": 3.0,
+        "max_snap_distance_m": 0.25,
+    }
+    values.update(overrides)
+    assert navigation_oracle_invalid_reason(**values) == expected
 
 
 def test_render_protocol_round_trip_uses_length_prefix():

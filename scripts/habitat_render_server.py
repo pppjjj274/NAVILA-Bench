@@ -23,6 +23,7 @@ from safe_vln.live_render import (
     isaac_position_to_habitat,
     isaac_wxyz_to_yaw,
     isaac_yaw_to_habitat_yaw,
+    navigation_oracle_invalid_reason,
     oracle_payload,
     quantize_dynamic_oracle,
     recv_json_message,
@@ -246,16 +247,32 @@ class HabitatRenderer:
         )
         snapped_goal = np.asarray(self.simulator.pathfinder.snap_point(goal), dtype=np.float32)
         goal_valid = bool(np.all(np.isfinite(snapped_goal)))
+        goal_snap_distance = (
+            float(np.linalg.norm((snapped_goal - goal)[[0, 2]]))
+            if goal_valid
+            else math.inf
+        )
         if snap_valid and goal_valid:
             geodesic_distance, path_points = self._shortest_path(snapped, snapped_goal)
         else:
             geodesic_distance, path_points = math.inf, []
-        reward_valid = bool(
-            snap_valid
-            and goal_valid
-            and horizontal_snap_distance <= float(self.args.max_snap_distance)
-            and math.isfinite(geodesic_distance)
+        oracle_invalid_reason = navigation_oracle_invalid_reason(
+            start_snap_valid=snap_valid,
+            goal_snap_valid=goal_valid,
+            start_snap_distance_m=(
+                horizontal_snap_distance
+                if math.isfinite(horizontal_snap_distance)
+                else None
+            ),
+            goal_snap_distance_m=(
+                goal_snap_distance if math.isfinite(goal_snap_distance) else None
+            ),
+            geodesic_distance_m=(
+                geodesic_distance if math.isfinite(geodesic_distance) else None
+            ),
+            max_snap_distance_m=float(self.args.max_snap_distance),
         )
+        reward_valid = oracle_invalid_reason is None
 
         state = self.agent.get_state()
         state.position = render_position
@@ -283,6 +300,8 @@ class HabitatRenderer:
                 forward_distance_m=self.args.oracle_lookahead,
                 success_distance_m=success_distance_m,
             )
+            if action_id is None:
+                oracle_invalid_reason = "path_bearing_degenerate"
         else:
             relative_bearing = None
             action_id = None
@@ -305,6 +324,16 @@ class HabitatRenderer:
             "navmesh_snap_distance": (
                 horizontal_snap_distance if math.isfinite(horizontal_snap_distance) else None
             ),
+            "start_snap_valid": snap_valid,
+            "goal_snap_valid": goal_valid,
+            "start_snap_distance_m": (
+                horizontal_snap_distance
+                if math.isfinite(horizontal_snap_distance)
+                else None
+            ),
+            "goal_snap_distance_m": (
+                goal_snap_distance if math.isfinite(goal_snap_distance) else None
+            ),
             "is_navigable": bool(
                 snap_valid and self.simulator.pathfinder.is_navigable(snapped)
             ),
@@ -312,6 +341,7 @@ class HabitatRenderer:
                 geodesic_distance if math.isfinite(geodesic_distance) else None
             ),
             "navigation_reward_valid": reward_valid,
+            "oracle_invalid_reason": oracle_invalid_reason,
             "success_distance_m": success_distance_m,
             "relative_path_bearing": relative_bearing,
             **oracle_payload(action_id),

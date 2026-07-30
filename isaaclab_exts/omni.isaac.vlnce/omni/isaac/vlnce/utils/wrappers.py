@@ -152,6 +152,7 @@ class VLNEnvWrapper:
                  safe_vln=False, contact_threshold=1.0, orientation_limit=0.8,
                  blocked_seconds=2.0, blocked_distance=0.1,
                  cost_profile=None, calibration_file=None,
+                 strict_start_alignment=False,
                  measure_names=["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]
         ):
         self.env = env
@@ -161,6 +162,7 @@ class VLNEnvWrapper:
         if safe_vln and task_name != "go2_matterport_vision":
             raise ValueError("Safe-VLN currently supports only go2_matterport_vision")
         self.safe_vln = safe_vln
+        self.strict_start_alignment = bool(strict_start_alignment)
         if cost_profile is None:
             profile = deepcopy(default_cost_profile())
             profile.pop("fingerprint", None)
@@ -390,6 +392,25 @@ class VLNEnvWrapper:
     def set_measures(self):
         self.measure_manager = add_measurement(self.env, self.episode, self.measure_names)
 
+    def _restore_episode_start_root_state(self) -> None:
+        """Keep excluded Go2 warmup steps from moving the strict episode start."""
+        if not self.strict_start_alignment:
+            return
+        if "go2" not in self.task_name:
+            raise RuntimeError("strict start alignment currently supports only Go2")
+        robot = self.unwrapped.scene["robot"]
+        start = [float(value) for value in self.episode["start_position"]]
+        rotation = [float(value) for value in self.episode["start_rotation"]]
+        root_pose = torch.as_tensor(
+            [[start[0], start[1], start[2] + 0.4, *rotation]],
+            dtype=robot.data.root_pos_w.dtype,
+            device=robot.data.root_pos_w.device,
+        )
+        if root_pose.shape != (1, 7):
+            raise RuntimeError("strict Go2 start pose must have shape (1, 7)")
+        robot.write_root_pose_to_sim(root_pose)
+        robot.write_root_velocity_to_sim(torch.zeros_like(robot.data.root_vel_w))
+
     def reset(self) -> tuple[torch.Tensor, dict]:
         """Reset the environment."""
         low_level_obs, infos = self.env.reset()
@@ -412,6 +433,14 @@ class VLNEnvWrapper:
             low_level_obs, _, _, infos = self.env.step(actions)
             self.low_level_obs = low_level_obs
             self.low_level_action = actions
+            if self.strict_start_alignment:
+                self._restore_episode_start_root_state()
+                low_level_obs, refreshed = self.env.get_observations()
+                self.low_level_obs = low_level_obs
+                if isinstance(refreshed, dict) and "observations" in refreshed:
+                    infos["observations"] = refreshed["observations"]
+
+        self._restore_episode_start_root_state()
 
         self.env_step, self.same_pos_count = 0, 0
         self.blocked_detector.reset()
