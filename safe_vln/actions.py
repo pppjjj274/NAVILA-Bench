@@ -107,7 +107,15 @@ def _action_probabilities(value: Any) -> list[float] | None:
     ):
         return None
     total = sum(probabilities)
+    if not math.isclose(total, 1.0, rel_tol=1e-5, abs_tol=1e-5):
+        return None
     return [item / total for item in probabilities]
+
+
+def _policy_version(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def normalize_policy_response(response: Any) -> dict[str, Any]:
@@ -120,8 +128,9 @@ def normalize_policy_response(response: Any) -> dict[str, Any]:
     invalid_action = False
 
     if structured and "action_id" in response:
+        raw_action_id = response["action_id"]
         try:
-            action = action_from_id(int(response["action_id"]))
+            action = action_from_id(raw_action_id)
         except (TypeError, ValueError):
             action, invalid_action = ACTIONS[9], True
     else:
@@ -135,7 +144,21 @@ def normalize_policy_response(response: Any) -> dict[str, Any]:
             "reward_value": _finite_optional_float(response.get("reward_value")) if structured else None,
             "cost_value": _finite_optional_float(response.get("cost_value")) if structured else None,
             "log_prob": _finite_optional_float(response.get("log_prob")) if structured else None,
-            "policy_version": response.get("policy_version") if structured else None,
+            "policy_version": (
+                _policy_version(response.get("policy_version"))
+                if structured
+                else None
+            ),
+            # Plain text is the public interface of the original NaViLA
+            # greedy decoder.  Recording that identity explicitly lets data
+            # audits distinguish base-policy demonstrations from Safe-VLN
+            # discrete-policy rollouts; it still cannot satisfy PPO's
+            # probability/value requirements below.
+            "policy_interface": (
+                response.get("policy_interface")
+                if structured
+                else "navila-greedy-text-v1"
+            ),
             "objective_fingerprint": (
                 response.get("objective_fingerprint") if structured else None
             ),
@@ -158,17 +181,40 @@ def has_valid_policy_statistics(
     """Return whether a response is safe to use as an on-policy PPO sample."""
     if objective_fingerprint is None:
         return False
+    if policy_output.get("invalid_action", False):
+        return False
     if policy_output.get("objective_fingerprint") != objective_fingerprint:
         return False
-    if policy_output.get("policy_version") is None:
+    policy_version = policy_output.get("policy_version")
+    if (
+        isinstance(policy_version, bool)
+        or not isinstance(policy_version, int)
+        or policy_version < 0
+    ):
         return False
-    if policy_output.get("action_probabilities") is None:
+    if policy_output.get("policy_interface") != "safe-vln-discrete-v1":
         return False
-    return all(
+    probabilities = policy_output.get("action_probabilities")
+    if probabilities is None:
+        return False
+    if not all(
         value is not None and math.isfinite(float(value))
         for value in (
             policy_output.get("log_prob"),
             policy_output.get("reward_value"),
             policy_output.get("cost_value"),
         )
+    ):
+        return False
+    action_id = policy_output.get("action_id")
+    if isinstance(action_id, bool) or not isinstance(action_id, int):
+        return False
+    selected_probability = float(probabilities[action_id])
+    if selected_probability <= 0.0:
+        return False
+    return math.isclose(
+        float(policy_output["log_prob"]),
+        math.log(selected_probability),
+        rel_tol=1e-4,
+        abs_tol=1e-4,
     )

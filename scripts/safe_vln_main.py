@@ -15,6 +15,10 @@ from safe_vln import train as pipeline
 from safe_vln.calibration import fit_cost_profile, read_calibration_records
 from safe_vln.objective import save_cost_profile
 from safe_vln.replay import DEFAULT_VLNCE_TRAIN_METADATA
+from safe_vln.goal_stop import GOAL_STOP_MODES
+from safe_vln.dataset import iter_sample_refs
+from safe_vln.sampling import select_risk_episodes
+from safe_vln.vlnce_dataset import load_isaac_vlnce_payload
 
 
 def add_eval_args(parser):
@@ -27,10 +31,18 @@ def add_eval_args(parser):
     parser.add_argument("--end-idx", type=int)
     parser.add_argument("--vlm-host", default="localhost")
     parser.add_argument("--vlm-port", type=int, default=54321)
+    parser.add_argument("--vlm-timeout-seconds", type=float, default=300.0)
     parser.add_argument("--cost-limit", type=float)
     parser.add_argument("--safe-cost-profile")
     parser.add_argument("--blocked-seconds", type=float, default=2.0)
     parser.add_argument("--blocked-distance", type=float, default=0.10)
+    parser.add_argument(
+        "--turn-min-expected-angle",
+        type=float,
+        default=0.18,
+        help="Minimum requested yaw (rad) before proportional turn checking.",
+    )
+    parser.add_argument("--turn-min-achieved-ratio", type=float, default=0.25)
     parser.add_argument("--dataset-dir")
     parser.add_argument("--safe-replay", action="store_true")
     parser.add_argument("--safe-replay-root")
@@ -44,6 +56,7 @@ def add_eval_args(parser):
     parser.add_argument("--safe-replay-vlnce-gt")
     parser.add_argument("--safe-replay-legacy-unpaired", action="store_true")
     parser.add_argument("--safe-policy-tag")
+    parser.add_argument("--online-round", type=int)
     parser.add_argument("--safe-live-render", action="store_true")
     parser.add_argument("--render-host", default="127.0.0.1")
     parser.add_argument("--render-port", type=int, default=54322)
@@ -56,7 +69,7 @@ def add_eval_args(parser):
     parser.add_argument("--dataset-role", choices=("train", "eval"), default="train")
     parser.add_argument(
         "--goal-stop-mode",
-        choices=("policy", "shield"),
+        choices=GOAL_STOP_MODES,
         default="policy",
     )
     parser.add_argument(
@@ -64,6 +77,7 @@ def add_eval_args(parser):
         choices=("vlm", "oracle"),
         default="vlm",
     )
+    parser.add_argument("--allow-online-oracle", action="store_true")
     parser.add_argument("--missed-stop-penalty", type=float, default=-0.5)
     parser.add_argument("--missed-stop-patience", type=int, default=3)
     parser.add_argument("--max-vlm-calls", type=int)
@@ -205,16 +219,30 @@ def run_episodes(args):
         raise ValueError("--blocked-seconds must be positive")
     if args.blocked_distance <= 0:
         raise ValueError("--blocked-distance must be positive")
+    if args.turn_min_expected_angle < 0:
+        raise ValueError("--turn-min-expected-angle must be non-negative")
+    if not 0 <= args.turn_min_achieved_ratio <= 1:
+        raise ValueError("--turn-min-achieved-ratio must be in [0, 1]")
     if args.max_vlm_calls is not None and args.max_vlm_calls <= 0:
         raise ValueError("--max-vlm-calls must be positive")
     if args.max_episode_seconds is not None and args.max_episode_seconds <= 0:
         raise ValueError("--max-episode-seconds must be positive")
     if args.render_timeout_seconds <= 0:
         raise ValueError("--render-timeout-seconds must be positive")
+    if args.vlm_timeout_seconds <= 0:
+        raise ValueError("--vlm-timeout-seconds must be positive")
     if args.missed_stop_patience <= 0:
         raise ValueError("--missed-stop-patience must be positive")
-    with gzip.open(args.r2r_data_path, "rt", encoding="utf-8") as file:
-        episodes = json.load(file)["episodes"]
+    if not args.safe_replay and not args.safe_live_render:
+        native_payload = load_isaac_vlnce_payload(
+            args.r2r_data_path,
+            expected_role=args.dataset_role,
+            expected_scene_count=61 if args.dataset_role == "train" else None,
+        )
+        episodes = native_payload["episodes"]
+    else:
+        with gzip.open(args.r2r_data_path, "rt", encoding="utf-8") as file:
+            episodes = json.load(file)["episodes"]
     replay_ids, end = _resolve_episode_plan(args, len(episodes))
     if args.safe_replay:
         if args.safe_replay_root is None:
@@ -236,9 +264,14 @@ def run_episodes(args):
             raise ValueError(
                 "--collection-policy=oracle is allowed only for train data"
             )
-        if args.collection_policy == "oracle" and args.goal_stop_mode == "shield":
+        if args.collection_policy == "oracle" and not args.allow_online_oracle:
             raise ValueError(
-                "--collection-policy=oracle cannot be combined with shield mode"
+                "live dynamic Oracle is paused; use paired offline labels or "
+                "pass --allow-online-oracle for an ablation"
+            )
+        if args.collection_policy == "oracle" and args.goal_stop_mode != "policy":
+            raise ValueError(
+                "--collection-policy=oracle requires --goal-stop-mode=policy"
             )
         _preflight_live_assets(args, replay_ids)
     if not 0 <= args.start_idx < end:
@@ -253,14 +286,19 @@ def run_episodes(args):
             "--history_length=9",
             f"--load_run={args.low_level_policy_dir}",
             "--headless",
+            f"--r2r-data-path={args.r2r_data_path}",
             f"--episode_idx={index}",
             f"--vlm_host={args.vlm_host}",
             f"--vlm_port={args.vlm_port}",
+            f"--vlm-timeout-seconds={args.vlm_timeout_seconds}",
             "--safe-vln",
             f"--safe-blocked-seconds={args.blocked_seconds}",
             f"--safe-blocked-distance={args.blocked_distance}",
+            f"--safe-turn-min-expected-angle={args.turn_min_expected_angle}",
+            f"--safe-turn-min-achieved-ratio={args.turn_min_achieved_ratio}",
             f"--goal-stop-mode={args.goal_stop_mode}",
             f"--collection-policy={args.collection_policy}",
+            *(["--allow-online-oracle"] if args.allow_online_oracle else []),
             f"--missed-stop-penalty={args.missed_stop_penalty}",
             f"--missed-stop-patience={args.missed_stop_patience}",
         ]
@@ -306,6 +344,8 @@ def run_episodes(args):
                 command.append("--safe-replay-legacy-unpaired")
             if args.safe_policy_tag:
                 command.append(f"--safe-policy-tag={args.safe_policy_tag}")
+            if args.online_round is not None:
+                command.append(f"--online-round={args.online_round}")
         elif args.safe_live_render:
             vlnce_id = replay_ids[index - args.start_idx]
             command.extend(
@@ -327,6 +367,8 @@ def run_episodes(args):
                 command.append(f"--vlnce-gt={args.vlnce_gt}")
             if args.safe_policy_tag:
                 command.append(f"--safe-policy-tag={args.safe_policy_tag}")
+            if args.online_round is not None:
+                command.append(f"--online-round={args.online_round}")
         else:
             command.append("--enable_cameras")
         if args.dataset_dir:
@@ -358,7 +400,10 @@ def summarize(args):
     def mean(key):
         return sum(float(row.get(key, 0.0) or 0.0) for row in rows) / len(rows)
 
-    costs = sorted(float(row.get("cumulative_cost", 0.0)) for row in rows)
+    costs = sorted(
+        float(row.get("constraint_cost", row.get("cumulative_cost", 0.0)))
+        for row in rows
+    )
     stop_recalls = [
         float(row["stop_recall_in_goal"])
         for row in rows
@@ -380,7 +425,14 @@ def summarize(args):
         "safe_success_rate": mean("safe_success"),
         "safe_spl": mean("safe_spl"),
         "mean_reward": mean("total_high_level_reward"),
-        "mean_cost": mean("cumulative_cost"),
+        "mean_cost": (
+            sum(
+                float(row.get("constraint_cost", row.get("cumulative_cost", 0.0)))
+                for row in rows
+            )
+            / len(rows)
+        ),
+        "mean_cumulative_cost": mean("cumulative_cost"),
         "mean_hard_cost": mean("cumulative_hard_cost"),
         "mean_dense_cost": mean("cumulative_dense_cost"),
         "hard_violation_rate": sum(
@@ -391,6 +443,9 @@ def summarize(args):
         "zero_cost_rate": sum(cost == 0 for cost in costs) / len(costs),
         "collision_rate": mean("has_collision"),
         "blocked_rate": mean("has_blocked"),
+        "turn_tracking_failure_rate": mean("has_turn_tracking_failure"),
+        # Deprecated output alias for readers of pre-v4 result summaries.
+        "turn_blocked_rate": mean("has_turn_tracking_failure"),
         "constraint_satisfaction_rate": mean("constraint_satisfied"),
         "cost_p90": percentile(0.90),
         "cost_p95": percentile(0.95),
@@ -458,6 +513,12 @@ def add_model_args(parser, *, train=False):
         parser.add_argument("--clip-ratio", type=float, default=0.1)
         parser.add_argument("--ppo-epochs", type=int, default=4)
         parser.add_argument("--mini-batch-size", type=int, default=16)
+        parser.add_argument(
+            "--gradient-accumulation-steps",
+            type=int,
+            default=8,
+            help="Accumulate Safe-PPO micro-batches before one optimizer update.",
+        )
         parser.add_argument("--gamma", type=float, default=0.99)
         parser.add_argument("--gae-lambda", type=float, default=0.95)
         parser.add_argument("--lagrange-lr", type=float, default=0.035)
@@ -481,6 +542,12 @@ def parse_args():
     calibrate = subparsers.add_parser("calibrate-safety")
     add_eval_args(calibrate)
     calibrate.add_argument("--output-profile", required=True)
+    risk = subparsers.add_parser("select-risk-episodes")
+    risk.add_argument("--dataset-dir", required=True)
+    risk.add_argument("--output", required=True)
+    risk.add_argument("--split", default="train")
+    risk.add_argument("--per-stratum", type=int, default=20)
+    risk.add_argument("--max-per-scene", type=int, default=2)
     warmup = subparsers.add_parser("warmup-critics")
     add_model_args(warmup)
     actor_warmup = subparsers.add_parser("warmup-actor")
@@ -496,8 +563,21 @@ def parse_args():
     actor_warmup.add_argument("--split", default="train")
     actor_warmup.add_argument(
         "--actor-architecture",
-        choices=("hierarchical-stop-motion", "candidate-scoring"),
+        choices=(
+            "hierarchical-stop-direction-magnitude",
+            "hierarchical-stop-motion",
+            "candidate-scoring",
+        ),
         default="hierarchical-stop-motion",
+    )
+    actor_warmup.add_argument(
+        "--actor-target-source",
+        choices=("oracle", "navila-policy"),
+        default="navila-policy",
+        help=(
+            "Supervise from strict dynamic-oracle labels, or distill the "
+            "original NaViLA greedy policy recorded by native/live collection."
+        ),
     )
     actor_warmup.add_argument("--actor-lr", type=float, default=1e-6)
     actor_warmup.add_argument("--head-lr", type=float, default=1e-4)
@@ -506,9 +586,33 @@ def parse_args():
     actor_warmup.add_argument("--head-batch-size", type=int, default=256)
     actor_warmup.add_argument("--gradient-accumulation-steps", type=int, default=4)
     actor_warmup.add_argument("--max-grad-norm", type=float, default=0.5)
-    actor_warmup.add_argument("--stop-fraction", type=float, default=0.25)
+    actor_warmup.add_argument("--stop-fraction", type=float, default=0.10)
+    actor_warmup.add_argument(
+        "--hard-stop-negative-fraction", type=float, default=0.25
+    )
+    actor_warmup.add_argument(
+        "--hard-stop-negative-margin-m", type=float, default=1.0
+    )
     actor_warmup.add_argument("--stop-threshold", type=float, default=0.5)
-    actor_warmup.add_argument("--dev-episodes-per-scene", type=int, default=1)
+    actor_warmup.add_argument(
+        "--calibration-episodes-per-scene", type=int, default=1
+    )
+    actor_warmup.add_argument(
+        "--audit-episodes-per-scene", type=int, default=1
+    )
+    actor_warmup.add_argument(
+        "--dev-episodes-per-scene",
+        type=int,
+        help="deprecated alias overriding --audit-episodes-per-scene",
+    )
+    actor_warmup.add_argument(
+        "--calibrate-stop-threshold",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    actor_warmup.add_argument(
+        "--stop-threshold-grid-step", type=float, default=0.01
+    )
     actor_warmup.add_argument("--allow-small-dataset", action="store_true")
     actor_warmup.add_argument("--epochs", type=int, default=1)
     actor_warmup.add_argument("--mini-batch-size", type=int, default=1)
@@ -516,8 +620,8 @@ def parse_args():
     actor_warmup.add_argument("--oracle-stop-weight", type=float, default=5.0)
     actor_warmup.add_argument(
         "--sampling-strategy",
-        choices=("sequential", "balanced-oracle"),
-        default="sequential",
+        choices=("sequential", "balanced-oracle", "stratified"),
+        default="stratified",
     )
     actor_warmup.add_argument("--sampling-seed", type=int, default=20260729)
     actor_warmup.add_argument(
@@ -535,6 +639,62 @@ def parse_args():
         type=float,
         default=0.4,
     )
+    dagger_actor = subparsers.add_parser("dagger-actor")
+    dagger_actor.add_argument("--model-path", required=True)
+    dagger_actor.add_argument("--checkpoint", required=True)
+    dagger_actor.add_argument("--rollout-dir", required=True)
+    dagger_actor.add_argument("--anchor-dataset-dir", required=True)
+    dagger_actor.add_argument("--output-dir", required=True)
+    dagger_actor.add_argument("--device", default="cuda")
+    dagger_actor.add_argument(
+        "--training-dtype",
+        choices=("bfloat16", "float16"),
+        default="bfloat16",
+    )
+    dagger_actor.add_argument("--split", default="train")
+    dagger_actor.add_argument("--actor-lr", type=float, default=1e-6)
+    dagger_actor.add_argument("--head-lr", type=float, default=1e-4)
+    dagger_actor.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    dagger_actor.add_argument("--max-grad-norm", type=float, default=0.5)
+    dagger_actor.add_argument("--epochs", type=int, default=1)
+    dagger_actor.add_argument("--max-samples", type=int, default=4000)
+    dagger_actor.add_argument("--online-fraction", type=float, default=0.60)
+    dagger_actor.add_argument("--sampling-seed", type=int, default=20260802)
+    dagger_actor.add_argument("--online-round", type=int, default=1)
+    dagger_actor.add_argument("--allow-small-dataset", action="store_true")
+    actor_audit = subparsers.add_parser("audit-actor")
+    actor_audit.add_argument("--model-path", required=True)
+    actor_audit.add_argument("--checkpoint", required=True)
+    actor_audit.add_argument("--dataset-dir", required=True)
+    actor_audit.add_argument("--output-dir", required=True)
+    actor_audit.add_argument("--device", default="cuda")
+    actor_audit.add_argument(
+        "--training-dtype",
+        choices=("bfloat16", "float16"),
+        default="bfloat16",
+    )
+    actor_audit.add_argument("--split", default="train")
+    actor_audit.add_argument("--dev-episodes-per-scene", type=int, default=1)
+    actor_audit.add_argument("--allow-small-dataset", action="store_true")
+    actor_audit.add_argument("--sampling-seed", type=int, default=20260729)
+    actor_audit.add_argument(
+        "--minimum-stop-accuracy", type=float, default=0.5
+    )
+    actor_audit.add_argument(
+        "--maximum-false-stop-rate", type=float, default=0.05
+    )
+    actor_audit.add_argument(
+        "--stop-threshold-grid-step", type=float, default=0.01
+    )
+    actor_audit.add_argument(
+        "--goal-stop-contract",
+        choices=("policy-v1", "sensor-gated-v1"),
+        default="policy-v1",
+    )
+    actor_audit.add_argument("--certify", action="store_true")
+    actor_audit.add_argument(
+        "--minimum-non-stop-macro-accuracy", type=float, default=0.4
+    )
     train = subparsers.add_parser("train")
     add_model_args(train, train=True)
     summary = subparsers.add_parser("summarize")
@@ -545,6 +705,22 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.command == "select-risk-episodes":
+        selected = select_risk_episodes(
+            iter_sample_refs(args.dataset_dir, args.split),
+            per_stratum=args.per_stratum,
+            max_per_scene=args.max_per_scene,
+        )
+        output = Path(args.output).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(selected, indent=2), encoding="utf-8")
+        ids_path = output.with_suffix(".txt")
+        ids_path.write_text(
+            "\n".join(row["episode_id"] for row in selected) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps({"episodes": len(selected), "output": str(output), "ids": str(ids_path)}))
+        return 0
     if args.command == "collect":
         if not args.dataset_dir:
             raise ValueError("collect requires --dataset-dir")
@@ -594,6 +770,10 @@ def main():
         return pipeline.warmup(args)
     if args.command == "warmup-actor":
         return pipeline.warmup_actor(args)
+    if args.command == "dagger-actor":
+        return pipeline.dagger_actor(args)
+    if args.command == "audit-actor":
+        return pipeline.audit_actor(args)
     if args.command == "train":
         return pipeline.train(args)
     return summarize(args)

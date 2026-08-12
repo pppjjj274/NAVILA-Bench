@@ -9,8 +9,10 @@ from safe_vln.objective import (
     default_cost_profile,
     graded_oracle_reward,
     validate_cost_profile,
+    validate_objective_config,
 )
 from safe_vln.trajectory import SafeTrajectoryRecorder
+from safe_vln.live_render import LIVE_SCHEMA_VERSION
 
 
 @pytest.mark.parametrize(
@@ -39,6 +41,15 @@ def test_cost_profile_fingerprint_detects_mutation():
     profile["soft_thresholds"]["near_safe_m"] = 0.9
     with pytest.raises(ValueError, match="fingerprint"):
         validate_cost_profile(profile)
+
+
+def test_current_objective_requires_cumulative_episode_cost_contract():
+    objective = build_objective_config(default_cost_profile())
+    assert objective["cost_normalization"] == "cumulative_episode_sum"
+    objective.pop("fingerprint")
+    objective.pop("cost_normalization")
+    with pytest.raises(ValueError, match="cost_normalization"):
+        validate_objective_config(objective)
 
 
 def test_macro_dense_cost_aggregates_mean_and_peak_without_termination():
@@ -120,6 +131,30 @@ def test_hard_events_are_counted_once_even_when_multiple_flags_fire():
     assert item["hard_cost"] == 1.0
     assert item["dense_cost"] == 0.1
     assert item["cost"] == 1.1
+
+
+def test_live_container_schema_is_separate_from_objective_schema():
+    objective = build_objective_config(default_cost_profile())
+    recorder = SafeTrajectoryRecorder(
+        episode_id="1",
+        scene_id="scene",
+        instruction="go",
+        objective_config=objective,
+        schema_version=LIVE_SCHEMA_VERSION,
+    )
+    recorder.begin(
+        {
+            "action_id": 8,
+            "text": "move",
+            "velocity_command": [0.5, 0.0, 0.0],
+            "duration": 1.5,
+        },
+        5.0,
+    )
+    item = recorder.finish(distance_after=4.9)
+    assert item["schema_version"] == LIVE_SCHEMA_VERSION
+    assert recorder.to_dict()["schema_version"] == LIVE_SCHEMA_VERSION
+    assert recorder.to_dict()["objective_config"]["schema_version"] == SCHEMA_VERSION
 
 
 def test_calibration_uses_bounded_quantiles_and_requires_episode_coverage(tmp_path):

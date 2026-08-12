@@ -10,11 +10,12 @@ from pathlib import Path
 import re
 import shutil
 import tarfile
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 import uuid
 
 from PIL import Image
 
+from .live_render import LIVE_SCHEMA_VERSION
 from .objective import SCHEMA_VERSION, validate_objective_config
 
 
@@ -97,6 +98,14 @@ class SafeVLNShardWriter:
             or (SCHEMA_VERSION if self.objective_config else "safe-vln-go2-v1")
         )
         self.objective_fingerprint = self.objective_config.get("fingerprint")
+        if (
+            self.schema_version == LIVE_SCHEMA_VERSION
+            and self.objective_config.get("schema_version") != SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"{LIVE_SCHEMA_VERSION} datasets require the current "
+                f"{SCHEMA_VERSION} objective contract"
+            )
         if self.schema_version == SCHEMA_VERSION and not self.objective_fingerprint:
             raise ValueError(
                 "versioned Safe-VLN shards require an objective fingerprint"
@@ -115,6 +124,7 @@ class SafeVLNShardWriter:
         self.shard_index = self._next_shard_index()
         self.sample_count = 0
         self.total_samples = 0
+        self._keys = self._existing_sample_keys()
         self._tar: tarfile.TarFile | None = None
         self._temporary_path: Path | None = None
 
@@ -126,6 +136,20 @@ class SafeVLNShardWriter:
             except (IndexError, ValueError):
                 continue
         return max(indices, default=-1) + 1
+
+    def _existing_sample_keys(self) -> set[str]:
+        keys: set[str] = set()
+        for shard_path in sorted(self.output_dir.glob(f"{self.split}-*.tar")):
+            with tarfile.open(shard_path, "r") as archive:
+                for member in archive:
+                    if member.isfile() and member.name.endswith(".json"):
+                        key = member.name[:-5]
+                        if key in keys:
+                            raise RuntimeError(
+                                f"existing Safe-VLN dataset has duplicate key: {key}"
+                            )
+                        keys.add(key)
+        return keys
 
     def _open(self) -> None:
         name = f"{self.split}-{self.shard_index:06d}.tar"
@@ -141,17 +165,25 @@ class SafeVLNShardWriter:
     def add(self, key: str, frames: Sequence[Image.Image], metadata: Mapping[str, Any]) -> None:
         if len(frames) != 8:
             raise ValueError(f"Safe-VLN samples require exactly 8 frames, got {len(frames)}")
-        if self._tar is None:
-            self._open()
         safe_key = key.replace("..", "_").strip("/")
         if not safe_key:
             raise ValueError("sample key cannot be empty")
+        if safe_key in self._keys:
+            raise ValueError(f"duplicate sample key: {safe_key}")
+        self._keys.add(safe_key)
+        if self._tar is None:
+            self._open()
         for index, frame in enumerate(frames):
             self._add_bytes(
                 f"{safe_key}.{index}.jpg",
                 _encode_jpeg(frame, self.jpeg_quality),
             )
-        payload = json.dumps(dict(metadata), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        payload = json.dumps(
+            dict(metadata),
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
         self._add_bytes(f"{safe_key}.json", payload)
         self.sample_count += 1
         self.total_samples += 1
@@ -268,6 +300,10 @@ class SafeVLNEpisodeWriter:
             / f"{safe_episode}-{uuid.uuid4().hex}"
         )
         self.final_dir = self.output_dir / "completed" / safe_episode
+        if self.final_dir.exists():
+            raise FileExistsError(
+                f"strict episode output already exists: {self.final_dir}"
+            )
         self.writer = SafeVLNShardWriter(
             self.pending_dir,
             split=split,
@@ -341,15 +377,26 @@ class SafeVLNEpisodeWriter:
     def commit(self) -> Path:
         if self._finished:
             raise RuntimeError("episode writer is already finished")
-        self.writer.close()
-        self._write_episode_manifest()
-        self.final_dir.parent.mkdir(parents=True, exist_ok=True)
+        if self.writer.total_samples <= 0:
+            self.abort()
+            raise RuntimeError("cannot commit an empty Safe-VLN episode")
         if self.final_dir.exists():
+            self.abort()
             raise FileExistsError(
                 f"strict episode output already exists: {self.final_dir}"
             )
+        self.writer.close()
+        self._write_episode_manifest()
+        self.final_dir.parent.mkdir(parents=True, exist_ok=True)
         self.pending_dir.replace(self.final_dir)
-        self._update_root_manifest()
+        try:
+            self._update_root_manifest()
+        except Exception:
+            # Roll back visibility if publishing the root manifest fails.
+            self.pending_dir.parent.mkdir(parents=True, exist_ok=True)
+            self.final_dir.replace(self.pending_dir)
+            self.abort()
+            raise
         self._finished = True
         return self.final_dir
 

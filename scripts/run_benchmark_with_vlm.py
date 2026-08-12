@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
+from safe_vln.rpc import bind_server_socket
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 NAVILA_EVAL_SCRIPT = REPO_ROOT / "scripts" / "navila_eval.py"
@@ -207,11 +209,8 @@ class VLMServer:
         ready_event: threading.Event | None = None,
     ) -> None:
         """Serve one request per TCP connection using a length-prefixed JSON protocol."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+        with bind_server_socket(host, port) as server_socket:
             self._server_socket = server_socket
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind((host, port))
-            server_socket.listen(1)
             server_socket.settimeout(1.0)
             print(f"VLM Server listening on {host}:{port}", flush=True)
 
@@ -467,7 +466,9 @@ def start_vlm_server(args: argparse.Namespace) -> tuple[object | None, threading
 
 def run_benchmark(args: argparse.Namespace) -> int:
     eval_args = build_eval_args(args)
-    episodes = read_episodes(resolve_repo_path(args.r2r_data_path))
+    r2r_data_path = resolve_repo_path(args.r2r_data_path)
+    eval_args.append(f"--r2r-data-path={r2r_data_path}")
+    episodes = read_episodes(r2r_data_path)
     end_idx = len(episodes) if args.end_idx is None else min(args.end_idx, len(episodes))
 
     if args.start_idx < 0 or args.start_idx >= len(episodes):

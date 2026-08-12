@@ -1,5 +1,3 @@
-# 中文注释: 导入 socket 标准库，用 TCP socket 给评测脚本提供一个本地 VLM 推理服务。
-import socket
 # 中文注释: 导入 PyTorch；这里用于模型推理、半精度张量转换和禁用初始化函数。
 import torch
 # 中文注释: 导入 json；客户端和服务端通过 JSON 传输图像列表、语言指令和文本响应。
@@ -18,11 +16,8 @@ import base64
 from io import BytesIO
 # 中文注释: 从 PIL 导入 Image；用于把客户端发来的图片字节转换成 RGB 图像。
 from PIL import Image
-# 中文注释: 导入 re 正则库；当前文件暂未使用，保留可能是为了后续解析 VLM 文本动作。
-import re
-
-# 中文注释: 导入 HuggingFace tokenizer 自动加载器和配置加载器，用于读取 NaVILA/LLaVA 模型配置。
-from transformers import AutoTokenizer, AutoConfig
+# 中文注释: 导入 HuggingFace tokenizer 自动加载器，用于读取 NaVILA tokenizer。
+from transformers import AutoTokenizer
 # 中文注释: 导入 LLaVA/NaVILA 的图像处理、prompt token 化、停止词和模型名解析工具。
 from llava.mm_utils import KeywordsStoppingCriteria, process_image, tokenizer_image_token, get_model_name_from_path
 # 中文注释: 导入图像占位 token 的索引，tokenizer_image_token 会用它把 <image> 替换成模型内部图像 token。
@@ -32,11 +27,17 @@ from llava.conversation import SeparatorStyle, conv_templates
 # 中文注释: 导入 NaVILA/LLaVA 的模型加载函数，用 checkpoint 路径创建 tokenizer、模型和 image_processor。
 from llava.model.builder import load_pretrained_model
 from safe_vln.actions import action_from_id
+from safe_vln.checkpoint import (
+    CHECKPOINT_ROLE_CRITIC_ONLY,
+    require_safe_policy_checkpoint,
+    safe_checkpoint_contract,
+)
 from safe_vln.live_render import LIVE_SCHEMA_VERSION
 from safe_vln.model import (
     ACTOR_ARCHITECTURE_CANDIDATE,
     SafeNavilaActorCritic,
 )
+from safe_vln.rpc import bind_server_socket, error_payload, recv_json, send_json
 
 
 # 中文注释: 定义 VLMServer 类；它负责加载 NaVILA 模型，并通过 TCP 接收图像+指令后返回动作文本。
@@ -59,6 +60,9 @@ class VLMServer:
         self.safe_model = None
         self.safe_policy_version = None
         self.safe_objective_fingerprint = None
+        self.safe_checkpoint_role = None
+        self.safe_policy_interface = None
+        self.safe_policy_enabled = False
         # 中文注释: 立即执行模型加载和初始化，让服务开始监听前就准备好推理所需资源。
         self.setup()
         if getattr(args, "safe_checkpoint", None):
@@ -66,6 +70,30 @@ class VLMServer:
 
     def _load_safe_checkpoint(self, checkpoint_path):
         """Load a LoRA adapter and the two Safe-VLN critic heads."""
+        trainer_state_path = os.path.join(checkpoint_path, "trainer_state.json")
+        if not os.path.isfile(trainer_state_path):
+            raise RuntimeError("Safe-VLN checkpoint has no trainer_state.json")
+        with open(trainer_state_path, "r", encoding="utf-8") as state_file:
+            trainer_state = json.load(state_file)
+        contract = safe_checkpoint_contract(trainer_state)
+        role = contract["checkpoint_role"]
+        allow_diagnostic = getattr(
+            self.args, "allow_diagnostic_safe_checkpoint", False
+        )
+        if role != CHECKPOINT_ROLE_CRITIC_ONLY:
+            require_safe_policy_checkpoint(
+                trainer_state,
+                context="VLM serving",
+                allow_diagnostic=allow_diagnostic,
+            )
+        if (
+            role == CHECKPOINT_ROLE_CRITIC_ONLY
+            and not getattr(self.args, "safe_deterministic", True)
+        ):
+            raise RuntimeError(
+                "--no-safe_deterministic cannot be used with a critic-only "
+                "checkpoint; its Actor is the original deterministic NaViLA policy"
+            )
         try:
             from peft import PeftModel
         except ImportError as exc:
@@ -78,6 +106,15 @@ class VLMServer:
         if os.path.exists(actor_config_path):
             with open(actor_config_path, "r", encoding="utf-8") as config_file:
                 actor_config = json.load(config_file)
+        if (
+            actor_config.get("architecture") == "hierarchical-stop-direction-magnitude"
+            and not getattr(self.args, "allow_factorized_safe_checkpoint", False)
+        ):
+            raise RuntimeError(
+                "factorized Safe-VLN actors are diagnostic-only after turn-collapse "
+                "audit; use candidate-scoring or pass "
+                "--allow-factorized-safe-checkpoint"
+            )
         self.safe_model = SafeNavilaActorCritic(
             self.model,
             self.tokenizer,
@@ -91,18 +128,24 @@ class VLMServer:
         )
         self.safe_model.load_safe_heads(checkpoint_path, map_location=self.args.device)
         self.safe_model.eval()
-        trainer_state_path = os.path.join(checkpoint_path, "trainer_state.json")
-        if os.path.exists(trainer_state_path):
-            with open(trainer_state_path, "r", encoding="utf-8") as state_file:
-                trainer_state = json.load(state_file)
-            self.safe_policy_version = int(
-                trainer_state.get("policy_version", 0)
-            )
-            self.safe_objective_fingerprint = trainer_state.get(
-                "objective_fingerprint"
-            )
-        else:
-            self.safe_policy_version = 0
+        self.safe_checkpoint_role = role
+        self.safe_policy_interface = contract["policy_interface"]
+        self.safe_policy_enabled = role != CHECKPOINT_ROLE_CRITIC_ONLY
+        self.safe_policy_version = int(trainer_state.get("policy_version", 0))
+        self.safe_objective_fingerprint = trainer_state.get(
+            "objective_fingerprint"
+        )
+        actor_name = (
+            "original NaViLA greedy generation"
+            if not self.safe_policy_enabled
+            else actor_config.get("architecture", ACTOR_ARCHITECTURE_CANDIDATE)
+        )
+        print(
+            "[SAFE-VLN] loaded checkpoint "
+            f"role={self.safe_checkpoint_role} "
+            f"policy_interface={self.safe_policy_interface} actor={actor_name}",
+            flush=True,
+        )
 
     # 中文注释: 定义 setup 方法；它完成一次性初始化，避免每个请求都重复加载大模型。
     def setup(self):
@@ -150,8 +193,6 @@ class VLMServer:
             os.path.join(self.args.model_path, "llm"), use_fast=False
         # 中文注释: 结束 AutoTokenizer.from_pretrained 调用，把结果赋给 self.tokenizer。
         )
-        # 中文注释: 读取多模态模型配置；trust_remote_code=True 允许加载模型仓库自定义的配置类。
-        config = AutoConfig.from_pretrained(self.args.model_path, trust_remote_code=True)
 
     # 中文注释: 定义 W16A16 checkpoint 加载逻辑；该路径加载论文/评测使用的 NaVILA 模型。
     def _load_checkpoint_w16a16(self):
@@ -176,9 +217,11 @@ class VLMServer:
             #     ],
             # ).to(self.args.device)
             # 中文注释: 根据模型路径解析模型名称；注意这里沿用原代码里的全局 args，而不是 self.args。
-            model_name = get_model_name_from_path(args.model_path)
+            model_name = get_model_name_from_path(self.args.model_path)
             # 中文注释: 从 checkpoint 路径加载 tokenizer、模型、图像预处理器和上下文长度。
-            tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, model_name, None)
+            tokenizer, model, image_processor, context_len = load_pretrained_model(
+                self.args.model_path, model_name, None
+            )
             # 中文注释: 用 load_pretrained_model 返回的 tokenizer 覆盖初始化阶段加载的 tokenizer，确保与模型完全一致。
             self.tokenizer =  tokenizer
             # 中文注释: 保存加载好的 NaVILA/LLaVA 模型，后续 process_request 会调用 self.model.generate。
@@ -192,12 +235,9 @@ class VLMServer:
     def start_server(self, host='localhost', port=12345):
         # 中文注释: 这个 docstring 说明通信协议：每个 TCP 连接处理一个带长度头的 JSON 请求。
         """Serve one request per TCP connection using a length-prefixed JSON protocol."""
-        # 中文注释: 创建 IPv4/TCP socket，作为 VLM 推理服务的监听 socket。
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # 中文注释: 把服务 socket 绑定到指定 host 和 port，让客户端可以连接这个地址。
-        server_socket.bind((host, port))
-        # 中文注释: 开始监听连接，backlog=1 表示同时排队的连接数很小，符合单请求串行推理服务。
-        server_socket.listen(1)
+        # SO_REUSEADDR is set by the shared helper before bind(), allowing a
+        # dependent Slurm job to restart while old connections are in TIME_WAIT.
+        server_socket = bind_server_socket(host, port)
         # 中文注释: 打印监听地址，方便确认服务已经启动并等待客户端请求。
         print(f"VLM Server listening on {host}:{port}")
 
@@ -207,39 +247,12 @@ class VLMServer:
             conn, addr = server_socket.accept()
             # 中文注释: 用 try/finally 包住请求处理，确保无论成功还是异常都会关闭 conn。
             try:
-                # Protocol: 8-byte big-endian payload length, followed by JSON
-                # containing base64 JPEG frames and the natural-language query.
-                # 中文注释: 先读取 8 字节长度头；客户端用 big-endian 编码告诉服务端后面 JSON payload 有多长。
-                size_data = conn.recv(8)
-                # 中文注释: 如果只是端口探测或客户端提前断开，忽略这次空连接并继续服务后续请求。
-                if len(size_data) < 8:
-                    print(f"Ignoring incomplete request header from {addr}")
-                    continue
-                # 中文注释: 把 8 字节长度头转成整数，得到接下来需要接收的数据字节数。
-                size = int.from_bytes(size_data, 'big')
-                
-                # Receive the actual data
-                # 中文注释: 初始化二进制缓冲区，用来累计接收到的 JSON payload 字节。
-                data = b''
-                # 中文注释: 只要累计长度还没达到 size，就继续从 socket 读取后续分片。
-                while len(data) < size:
-                    # 中文注释: 每次最多读取 4096 字节，避免一次 recv 假设能拿到完整 payload。
-                    packet = conn.recv(4096)
-                    # 中文注释: 如果收到空 packet，说明客户端提前断开，停止继续读取。
-                    if not packet:
-                        # 中文注释: 跳出接收循环，后面会尝试解析当前已经收到的数据。
-                        break
-                    # 中文注释: 把本次收到的分片追加到 data 缓冲区中。
-                    data += packet
-
-                # 中文注释: 如果客户端在 payload 未发送完整时断开，忽略这次坏请求，避免服务进程退出。
-                if len(data) < size:
-                    print(f"Ignoring incomplete request payload from {addr}: got {len(data)} of {size} bytes")
-                    continue
-
-                # Parse the received data
-                # 中文注释: 将接收到的 UTF-8 JSON 字节解码并解析成 Python 字典。
-                request = json.loads(data.decode())
+                # Both sides use one shared fail-closed framing implementation.
+                # recv_exact handles fragmented TCP headers/payloads, while the
+                # size limit rejects corrupt or hostile lengths before allocation.
+                request = recv_json(conn)
+                if not isinstance(request, dict):
+                    raise ValueError("VLM request must be a JSON object")
                 # 中文注释: 取出客户端发送的图像列表；每个元素通常是 base64 编码的 JPEG/PNG 字符串。
                 images = request['images']
                 # 中文注释: 取出自然语言导航指令，例如“go to the door”这类 VLN 任务描述。
@@ -250,28 +263,17 @@ class VLMServer:
                 # 中文注释: 调用 VLM 推理流程，根据多帧图像和语言指令生成下一步动作文本。
                 response = self.process_request(images, query)
                 
-                # Send response back
-                # 中文注释: 把动作文本响应编码成 JSON 字节，保持和请求一致的结构化传输方式。
-                response_bytes = json.dumps(response).encode()
-                # 中文注释: 单独保护发送过程；客户端可能在模型推理期间已经断开连接。
-                try:
-                    # 中文注释: 先发送 8 字节响应长度头，让客户端知道后面要读取多少字节。
-                    conn.sendall(len(response_bytes).to_bytes(8, 'big'))
-                    # 中文注释: 再发送真正的 JSON 响应内容。
-                    conn.sendall(response_bytes)
-                # 中文注释: 如果客户端在发送响应时断开连接，就捕获 BrokenPipeError 并打印提示。
-                except BrokenPipeError:
-                    # 中文注释: 输出具体客户端地址，方便定位哪个连接提前关闭。
-                    print(f"Client {addr} disconnected while sending response")
-                # 中文注释: 捕获其他发送异常，避免单个失败请求杀死整个服务进程。
-                except Exception as e:
-                    # 中文注释: 打印发送响应时的异常信息，便于调试 socket 通信问题。
-                    print(f"Error sending response to {addr}: {str(e)}")
+                send_json(conn, response)
 
             # 中文注释: 捕获单个坏请求的异常，避免 JSON 解析、字段缺失或推理错误直接杀死整个服务。
             except Exception as e:
-                # 中文注释: 打印坏请求来源和异常内容，服务端随后继续等待下一次连接。
                 print(f"Error processing request from {addr}: {str(e)}")
+                # A model/validation failure must reach the caller.  The old
+                # server only logged it, leaving navila_eval blocked on recv().
+                try:
+                    send_json(conn, error_payload(e))
+                except (BrokenPipeError, ConnectionError, OSError):
+                    pass
             # 中文注释: 无论请求解析、推理或响应发送是否成功，最后都要关闭本次连接。
             finally:
                 # 中文注释: 关闭当前客户端连接，服务端回到 while True 等待下一次连接。
@@ -281,6 +283,11 @@ class VLMServer:
     def process_request(self, images, query):
         # 中文注释: 这个 docstring 说明本函数会把历史帧+当前帧和语言指令送入 NaVILA。
         """Run NaVILA on eight sampled history/current frames and one instruction."""
+        if not isinstance(images, (list, tuple)) or len(images) != int(self.args.num_video_frames):
+            raise ValueError(
+                "Safe-VLN VLM requests must contain exactly "
+                f"{self.args.num_video_frames} frames"
+            )
         # Convert base64/PIL inputs to the tensor layout expected by LLaVA/NaVILA.
         # 中文注释: 将客户端传来的图片列表转成 NaVILA 图像编码器需要的张量格式。
         image_tensor = process_images(images, self.image_processor, self.model.config)
@@ -326,7 +333,7 @@ class VLMServer:
         stopping_criteria = KeywordsStoppingCriteria(keywords, self.tokenizer, input_ids)
 
         # 中文注释: 进入 inference_mode，关闭梯度和 autograd 记录，降低推理显存和计算开销。
-        if self.safe_model is not None:
+        if self.safe_model is not None and self.safe_policy_enabled:
             with torch.inference_mode():
                 safe_output = self.safe_model.act(
                     input_ids,
@@ -339,6 +346,7 @@ class VLMServer:
                 **safe_output,
                 "policy_version": self.safe_policy_version,
                 "objective_fingerprint": self.safe_objective_fingerprint,
+                "policy_interface": self.safe_policy_interface,
                 "action": action.text,
             }
 
@@ -375,9 +383,24 @@ class VLMServer:
 
         # 中文注释: 将生成的 token ids 解码成文本，并去掉特殊 token，得到可供导航解析的动作字符串。
         outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
-        
+        action_text = outputs.strip()
+        if self.safe_model is not None:
+            with torch.inference_mode():
+                values = self.safe_model.predict_values(
+                    input_ids, images=[image_tensor]
+                )
+            return {
+                "protocol_version": LIVE_SCHEMA_VERSION,
+                "action": action_text,
+                **values,
+                "policy_version": self.safe_policy_version,
+                "objective_fingerprint": self.safe_objective_fingerprint,
+                "policy_interface": self.safe_policy_interface,
+                "checkpoint_role": self.safe_checkpoint_role,
+            }
+
         # 中文注释: 去掉首尾空白后返回模型回复，例如 turn left、move forward 或 stop。
-        return outputs.strip()
+        return action_text
 
 
 # 中文注释: 定义图像预处理函数；它把 PIL/base64 图像列表转换成模型 image_processor 期望的张量。
@@ -399,14 +422,15 @@ def process_images(images, image_processor, model_cfg):
             try:
                 # Decode base64 string to PIL Image
                 # 中文注释: 将 base64 字符串解码成字节，再用 PIL 打开并统一转换为 RGB 三通道图像。
-                image = Image.open(BytesIO(base64.b64decode(image))).convert('RGB')
-            # 中文注释: 如果解码失败，捕获异常并走兜底图像逻辑，避免整个服务崩溃。
+                image = Image.open(
+                    BytesIO(base64.b64decode(image, validate=True))
+                ).convert('RGB')
+            # 中文注释: 如果解码失败，必须拒绝请求，不能悄悄替换视觉状态。
             except Exception as e:
-                # 中文注释: 打印解码失败原因，便于定位客户端传图或网络传输问题。
-                print(f"Error decoding base64 image: {e}")
-                # Create a blank image if decoding fails
-                # 中文注释: 创建一张黑色 RGB 占位图，让本次请求仍然能继续进入模型流程。
-                image = Image.new('RGB', (224, 224), (0, 0, 0))
+                # Safe-VLN must never turn a transport/rendering error into a
+                # synthetic black observation, otherwise actions and safety
+                # labels would be assigned to a different visual state.
+                raise ValueError("VLM received an invalid image payload") from e
         
         # process_image applies the model-specific resize/crop/normalization.
         # 中文注释: 调用 LLaVA/NaVILA 的单图预处理，执行模型需要的 resize、crop、normalize 等步骤。
@@ -441,9 +465,23 @@ if __name__ == "__main__":
     # 中文注释: 注册 --num_video_frames 参数，控制 prompt 中历史帧+当前帧的图像 token 数量。
     parser.add_argument("--num_video_frames", type=int, default=8)
     parser.add_argument("--safe_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--allow-diagnostic-safe-checkpoint",
+        action="store_true",
+        help="Allow loading a checkpoint whose actor audit failed (diagnosis only).",
+    )
+    parser.add_argument(
+        "--allow-factorized-safe-checkpoint",
+        action="store_true",
+        help="Allow the retired factorized actor for controlled ablation runs.",
+    )
     parser.add_argument("--safe_deterministic", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--safe_sampling_seed", type=int, default=20260801)
     # 中文注释: 解析命令行参数，并保存为全局 args；注意 _load_checkpoint_w16a16 里也直接引用了这个全局变量。
     args = parser.parse_args()
+    torch.manual_seed(args.safe_sampling_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.safe_sampling_seed)
     
     # 中文注释: 创建 VLMServer 实例；构造过程中会加载 tokenizer、模型和图像预处理器。
     server = VLMServer(args)

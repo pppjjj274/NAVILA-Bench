@@ -3,7 +3,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from safe_vln.checkpoint import load_go2_inference_checkpoint
+from safe_vln.checkpoint import (
+    CHECKPOINT_ROLE_CRITIC_ONLY,
+    CHECKPOINT_ROLE_POLICY,
+    POLICY_INTERFACE_NAVILA_GREEDY,
+    POLICY_INTERFACE_SAFE_DISCRETE,
+    SAFE_CHECKPOINT_CONTRACT_VERSION,
+    load_go2_inference_checkpoint,
+    require_safe_policy_checkpoint,
+    safe_checkpoint_contract,
+)
 
 
 class TinyActorCritic(torch.nn.Module):
@@ -120,3 +129,64 @@ def test_checkpoint_requires_normalizers_when_enabled(tmp_path):
         load_go2_inference_checkpoint(
             FakeRunner(empirical_normalization=True), path, map_location="cpu"
         )
+
+
+def test_legacy_checkpoint_without_actor_audit_is_critic_only():
+    contract = safe_checkpoint_contract({"mode": "warmup-critics"})
+    assert contract["checkpoint_role"] == CHECKPOINT_ROLE_CRITIC_ONLY
+    assert contract["policy_interface"] == POLICY_INTERFACE_NAVILA_GREEDY
+    with pytest.raises(RuntimeError, match="requires an independently audited"):
+        require_safe_policy_checkpoint({}, context="test")
+
+
+def test_policy_checkpoint_requires_independent_nonzero_audit_contract():
+    state = {
+        "checkpoint_contract_version": SAFE_CHECKPOINT_CONTRACT_VERSION,
+        "checkpoint_role": CHECKPOINT_ROLE_POLICY,
+        "policy_interface": POLICY_INTERFACE_SAFE_DISCRETE,
+        "actor/accepted": True,
+        "actor/audit_independent": True,
+        "calibration_episode_ids": ["calibration"],
+        "audit_episode_ids": ["audit"],
+        "actor/audit_target_source": "original-navila-policy",
+        "actor/minimum_stop_accuracy": 0.5,
+        "actor/minimum_non_stop_macro_accuracy": 0.4,
+    }
+    assert require_safe_policy_checkpoint(state, context="test") == {
+        "checkpoint_contract_version": SAFE_CHECKPOINT_CONTRACT_VERSION,
+        "checkpoint_role": CHECKPOINT_ROLE_POLICY,
+        "policy_interface": POLICY_INTERFACE_SAFE_DISCRETE,
+        "actor_audit_independent": True,
+    }
+    state["actor/minimum_non_stop_macro_accuracy"] = 0.0
+    with pytest.raises(RuntimeError, match="zero motion threshold"):
+        require_safe_policy_checkpoint(state, context="test")
+    state["actor/minimum_non_stop_macro_accuracy"] = 0.4
+    state.pop("actor/audit_target_source")
+    with pytest.raises(RuntimeError, match="audit target"):
+        require_safe_policy_checkpoint(state, context="test")
+
+
+def test_policy_checkpoint_rejects_unverifiable_independence_boolean():
+    state = {
+        "checkpoint_contract_version": SAFE_CHECKPOINT_CONTRACT_VERSION,
+        "checkpoint_role": CHECKPOINT_ROLE_POLICY,
+        "policy_interface": POLICY_INTERFACE_SAFE_DISCRETE,
+        "actor/accepted": True,
+        "actor/audit_independent": True,
+        "actor/audit_target_source": "original-navila-policy",
+        "actor/minimum_stop_accuracy": 0.5,
+        "actor/minimum_non_stop_macro_accuracy": 0.4,
+    }
+    with pytest.raises(RuntimeError, match="independent Actor audit"):
+        require_safe_policy_checkpoint(state, context="test")
+
+
+def test_legacy_accepted_actor_without_disjoint_audit_is_not_deployable():
+    state = {
+        "actor/accepted": True,
+        "calibration_episode_ids": ["same"],
+        "audit_episode_ids": ["same"],
+    }
+    with pytest.raises(RuntimeError, match="role='diagnostic'"):
+        require_safe_policy_checkpoint(state, context="test")

@@ -8,11 +8,11 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import importlib
 import os
 import json
 import math
 import re
-import time
 import base64
 import io
 import socket
@@ -30,6 +30,9 @@ from safe_vln.objective import (
     load_cost_profile,
     validate_cost_profile,
 )
+from safe_vln.goal_stop import GOAL_STOP_MODES
+from safe_vln.native_history import sample_native_history
+from safe_vln.vlnce_dataset import load_isaac_vlnce_payload
 from safe_vln.replay import (
     DEFAULT_VLNCE_TRAIN_METADATA,
     load_r2r_replay_episode,
@@ -42,7 +45,6 @@ from safe_vln.live_render import (
     LIVE_SCHEMA_VERSION,
     NAVILA_HISTORY_SAMPLING_POLICY,
     NAVILA_VIDEO_FRAMES,
-    habitat_yaw_to_isaac_yaw,
     isaac_position_to_habitat,
     isaac_wxyz_to_yaw,
     isaac_yaw_to_habitat_yaw,
@@ -68,8 +70,14 @@ parser.add_argument("--visualize_path", action="store_true", default=False, help
 parser.add_argument("--device", type=str, default="cuda")
 parser.add_argument("--vlm_host", type=str, default="localhost")
 parser.add_argument("--vlm_port", type=int, default=54321)
+parser.add_argument("--vlm-timeout-seconds", type=float, default=300.0)
 parser.add_argument("--max_episode_seconds", type=float, default=None)
 parser.add_argument("--max_vlm_calls", type=int, default=None)
+parser.add_argument(
+    "--r2r-data-path",
+    type=str,
+    default="isaaclab_exts/omni.isaac.vlnce/assets/vln_ce_isaac_v1.json.gz",
+)
 parser.add_argument("--safe-vln", action="store_true", help="Enable Go2 CMDP safety evaluation and trajectory output.")
 parser.add_argument("--safe-gamma", type=float, default=0.99)
 parser.add_argument("--safe-cost-limit", type=float, default=None)
@@ -79,6 +87,19 @@ parser.add_argument("--safe-contact-threshold", type=float, default=1.0)
 parser.add_argument("--safe-orientation-limit", type=float, default=0.8)
 parser.add_argument("--safe-blocked-seconds", type=float, default=2.0)
 parser.add_argument("--safe-blocked-distance", type=float, default=0.10)
+parser.add_argument(
+    "--safe-turn-min-expected-angle",
+    type=float,
+    default=0.18,
+    help=("Minimum requested yaw (rad) before proportional turn-execution "
+        "checking is enabled; the achieved-angle threshold is ratio-based."),
+)
+parser.add_argument(
+    "--safe-turn-min-achieved-ratio",
+    type=float,
+    default=0.25,
+    help="Minimum achieved/requested yaw ratio for a completed turn.",
+)
 parser.add_argument("--progress-reward-scale", type=float, default=1.0)
 parser.add_argument("--success-reward", type=float, default=10.0)
 parser.add_argument("--macro-step-penalty", type=float, default=-0.01)
@@ -87,9 +108,9 @@ parser.add_argument("--missed-stop-penalty", type=float, default=-0.5)
 parser.add_argument("--missed-stop-patience", type=int, default=3)
 parser.add_argument(
     "--goal-stop-mode",
-    choices=("policy", "shield"),
+    choices=GOAL_STOP_MODES,
     default="policy",
-    help="Raw policy execution or goal-radius STOP safety shield.",
+    help="Raw policy execution, goal shield, or authoritative sensor gate.",
 )
 parser.add_argument(
     "--collection-policy",
@@ -97,7 +118,13 @@ parser.add_argument(
     default="vlm",
     help="Use the VLM policy or the live dynamic oracle for data collection.",
 )
+parser.add_argument(
+    "--allow-online-oracle",
+    action="store_true",
+    help="Explicitly allow the experimental live navmesh oracle for ablations.",
+)
 parser.add_argument("--safe-dataset-dir", type=str, default=None)
+parser.add_argument("--online-round", type=int, default=None)
 parser.add_argument(
     "--safe-replay",
     action="store_true",
@@ -177,6 +204,10 @@ if args_cli.safe_blocked_seconds <= 0:
     parser.error("--safe-blocked-seconds must be positive")
 if args_cli.safe_blocked_distance <= 0:
     parser.error("--safe-blocked-distance must be positive")
+if args_cli.safe_turn_min_expected_angle < 0:
+    parser.error("--safe-turn-min-expected-angle must be non-negative")
+if not 0 <= args_cli.safe_turn_min_achieved_ratio <= 1:
+    parser.error("--safe-turn-min-achieved-ratio must be in [0, 1]")
 if args_cli.missed_stop_patience <= 0:
     parser.error("--missed-stop-patience must be positive")
 if args_cli.safe_calibration_file and not args_cli.safe_vln:
@@ -214,11 +245,16 @@ if args_cli.safe_live_render:
         parser.error("val_unseen live-render data requires --dataset-role=eval")
     if args_cli.collection_policy == "oracle" and args_cli.dataset_role != "train":
         parser.error("--collection-policy=oracle is allowed only for train data")
+    if args_cli.collection_policy == "oracle" and not args_cli.allow_online_oracle:
+        parser.error(
+            "live dynamic Oracle is paused because it is not closed-loop executable; "
+            "use offline paired labels or pass --allow-online-oracle for an ablation"
+        )
     if (
         args_cli.collection_policy == "oracle"
-        and args_cli.goal_stop_mode == "shield"
+        and args_cli.goal_stop_mode != "policy"
     ):
-        parser.error("--collection-policy=oracle cannot be combined with shield mode")
+        parser.error("--collection-policy=oracle requires --goal-stop-mode=policy")
 elif (
     args_cli.vlnce_episode_id is not None
     or args_cli.vlnce_metadata is not None
@@ -240,6 +276,7 @@ if args_cli.safe_replay:
 replay_episode_preflight = None
 replay_vlnce_metadata_preflight = None
 live_vlnce_metadata_preflight = None
+native_vlnce_payload_preflight = None
 if args_cli.safe_replay:
     replay_episode_preflight = load_r2r_replay_episode(
         args_cli.safe_replay_root,
@@ -277,6 +314,15 @@ if args_cli.safe_live_render:
         parser.error(f"live-render MP3D GLB does not exist: {live_scene_glb}")
     if not os.path.isfile(live_scene_navmesh):
         parser.error(f"live-render MP3D navmesh does not exist: {live_scene_navmesh}")
+if args_cli.safe_vln and not args_cli.safe_replay and not args_cli.safe_live_render:
+    try:
+        native_vlnce_payload_preflight = load_isaac_vlnce_payload(
+            args_cli.r2r_data_path,
+            expected_role=args_cli.dataset_role,
+            expected_scene_count=61 if args_cli.dataset_role == "train" else None,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        parser.error(str(error))
 
 if args_cli.safe_cost_profile:
     safe_cost_profile = load_cost_profile(args_cli.safe_cost_profile)
@@ -316,6 +362,11 @@ safe_objective_config["fingerprint"] = canonical_fingerprint(
 )
 
 # launch omniverse app
+# Keep Isaac Lab's headless-rendering experience GPU configuration intact.
+# In Isaac Sim 4.1, forcing ``multi_gpu=False`` at the launcher overrides the
+# experience's Vulkan/offscreen setup and can segfault while Hydra creates the
+# first camera viewport on A800 nodes.  Slurm isolates workers at the node/GPU
+# level; the experience itself already caps rendering to one GPU.
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -331,7 +382,11 @@ from safe_vln.actions import (
     has_valid_policy_statistics,
     normalize_policy_response,
 )
-from safe_vln.checkpoint import load_go2_inference_checkpoint
+from safe_vln.alignment import requires_strict_start_alignment
+from safe_vln.checkpoint import (
+    POLICY_INTERFACE_NAVILA_GREEDY,
+    load_go2_inference_checkpoint,
+)
 from safe_vln.dataset import (
     SafeVLNEpisodeWriter,
     SafeVLNShardWriter,
@@ -340,13 +395,14 @@ from safe_vln.dataset import (
 from safe_vln.objective import graded_oracle_reward
 from safe_vln.goal_stop import GoalStopController
 from safe_vln.trajectory import SafeTrajectoryRecorder
+from safe_vln.rpc import raise_for_remote_error, recv_json, send_json
 
 from rsl_rl.runners import OnPolicyRunner
 
-import omni.isaac.lab_tasks  # noqa: F401
+# Import for Gym task-registration side effects after SimulationApp starts.
+importlib.import_module("omni.isaac.lab_tasks")
 from omni.isaac.lab_tasks.utils import get_checkpoint_path, parse_env_cfg
 from omni.isaac.lab.utils.io import load_yaml
-import omni.isaac.lab.utils.math as math_utils
 from omni.isaac.lab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from omni.isaac.lab.utils import update_class_from_dict
 from omni.isaac.lab_tasks.utils.wrappers.rsl_rl import (
@@ -355,7 +411,8 @@ from omni.isaac.lab_tasks.utils.wrappers.rsl_rl import (
 )
 import omni.isaac.lab.sim as sim_utils
 
-from omni.isaac.vlnce.config import *
+# Import for local Gym task-registration side effects.
+importlib.import_module("omni.isaac.vlnce.config")
 from omni.isaac.vlnce.utils import ASSETS_DIR, RslRlVecEnvHistoryWrapper, VLNEnvWrapper
 from omni.isaac.vlnce.utils.eval_utils import (
     get_vel_command, 
@@ -363,7 +420,6 @@ from omni.isaac.vlnce.utils.eval_utils import (
     add_instruction_on_img,
     InstructionData, 
 )
-from omni.isaac.vlnce.utils.measures import PathLength, DistanceToGoal, Success, SPL, OracleNavigationError, OracleSuccess, MeasureManager
 
 
 def quat2eulers(q0, q1, q2, q3):
@@ -431,26 +487,15 @@ def reset_start_pos_rot(env_cfg, args_cli, episode):
     return env_cfg
 
 
-def add_measurement(env, episode):
-    measure_manager = MeasureManager()
-    measure_names = ["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]
-    for measure_name in measure_names:
-        measure = eval(measure_name)(env, episode, measure_manager)
-        measure_manager.register_measure(measure)
-    
-    env.measure_manager = measure_manager
-    return
-
-
 def sample_eight_images(image_list):
     if len(image_list) == 0:
         raise ValueError("Did not receive any images")
     if len(image_list) < 8:
-        print("Not enough images received, padding.")
+        print("Not enough images received; repeating the first valid frame.")
         image_list = image_list.copy()
-        # append image value=0, in front of the existing images, image size equal to the last one
+        first = image_list[0]
         for _ in range(8 - len(image_list)):
-            image_list.insert(0, Image.new('RGB', image_list[-1].size, (0, 0, 0)))
+            image_list.insert(0, first.copy())
     else:
         image_list = image_list.copy()
     num_images = len(image_list)
@@ -460,8 +505,30 @@ def sample_eight_images(image_list):
     return sampled_images
 
 
-def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query, request_metadata=None):
-    sampled_images = sample_eight_images(image_list)
+def sample_images_and_send_to_vlm(
+    image_list,
+    vlm_host,
+    vlm_port,
+    query,
+    request_metadata=None,
+    sampled_images=None,
+    timeout_seconds=300.0,
+):
+    """Send exactly one selected eight-frame history to the VLM.
+
+    Callers that already selected a history pass ``sampled_images`` so the
+    native-camera path does not pad/resample the same history twice.
+    """
+    sampled_images = (
+        list(sampled_images)
+        if sampled_images is not None
+        else sample_eight_images(image_list)
+    )
+    if len(sampled_images) != NAVILA_VIDEO_FRAMES:
+        raise ValueError(
+            f"VLM requests require exactly {NAVILA_VIDEO_FRAMES} frames, "
+            f"got {len(sampled_images)}"
+        )
 
     # save sampled images
     # time_stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -505,26 +572,10 @@ def sample_images_and_send_to_vlm(image_list, vlm_host, vlm_port, query, request
 
     # Send to VLM server
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(float(timeout_seconds))
         s.connect((vlm_host, vlm_port))
-        
-        # Send data
-        data_bytes = json.dumps(request_data).encode()
-        s.sendall(len(data_bytes).to_bytes(8, 'big'))
-        s.sendall(data_bytes)
-        
-        # Receive response
-        size_data = s.recv(8)
-        size = int.from_bytes(size_data, 'big')
-        
-        response_data = b''
-        while len(response_data) < size:
-            packet = s.recv(4096)
-            if not packet:
-                break
-            response_data += packet
-            
-        response = json.loads(response_data.decode())
-        return response
+        send_json(s, request_data)
+        return raise_for_remote_error(recv_json(s))
 
 
 def _measurement_distance(infos):
@@ -556,17 +607,29 @@ def _robot_pose(env):
     }
 
 
+def _native_camera_pose(env):
+    """Return the world pose that produced the current native RGB frame."""
+
+    camera = env.unwrapped.scene.sensors["rgbd_camera"].data
+    position = camera.pos_w[0].detach().cpu().tolist()
+    rotation = camera.quat_w_world[0].detach().cpu().tolist()
+    return {
+        "position": [float(value) for value in position],
+        "rotation_wxyz": [float(value) for value in rotation],
+    }
+
+
 def _sample_live_history(history):
     if not history:
         raise RuntimeError("strict live-render history is empty")
     width, height = history[-1]["image"].size
 
-    def black_padding():
+    def repeat_first_padding():
         return {
-            "image": Image.new("RGB", (width, height), (0, 0, 0)),
+            "image": history[0]["image"].copy(),
             "metadata": {
                 "history_padding": True,
-                "padding_policy": "black_left",
+                "padding_policy": "repeat_first",
                 "strict_observation_state_alignment": False,
                 "physics_step": None,
             },
@@ -575,7 +638,7 @@ def _sample_live_history(history):
     return sample_navila_history(
         history,
         num_frames=NAVILA_VIDEO_FRAMES,
-        padding_factory=black_padding,
+        padding_factory=repeat_first_padding,
     )
 
 
@@ -694,6 +757,7 @@ def _render_live_frame(
             f"paused_position={paused_position_error:.8f}m "
             f"paused_yaw={math.degrees(paused_yaw_error):.6f}deg"
         )
+    include_online_oracle = bool(args_cli.allow_online_oracle)
     metadata = {
         "request_id": request_id,
         "physics_step": int(physics_step),
@@ -722,9 +786,19 @@ def _render_live_frame(
             response.get("navigation_reward_valid", False)
         ),
         "success_distance_m": float(returned_success_distance),
-        "dynamic_oracle_action": response.get("dynamic_oracle_action"),
-        "oracle_valid": bool(response.get("oracle_valid", False)),
-        "oracle_invalid_reason": response.get("oracle_invalid_reason"),
+        "dynamic_oracle_action": (
+            response.get("dynamic_oracle_action")
+            if include_online_oracle
+            else None
+        ),
+        "oracle_valid": bool(
+            include_online_oracle and response.get("oracle_valid", False)
+        ),
+        "oracle_invalid_reason": (
+            response.get("oracle_invalid_reason")
+            if include_online_oracle
+            else "online_oracle_disabled"
+        ),
         "render_latency_ms": response.get("render_latency_ms"),
         "camera": response.get("camera"),
     }
@@ -743,7 +817,7 @@ def _live_output_metadata(vlnce_metadata, *, policy_version):
         "alignment_scope": "navigation_pose_xy_yaw",
         "camera_pose_policy": "navila_upright_1.25m",
         "history_sampling_policy": NAVILA_HISTORY_SAMPLING_POLICY,
-        "history_padding_policy": "black_left",
+        "history_padding_policy": "repeat_first",
         "history_num_frames": NAVILA_VIDEO_FRAMES,
         "physical_episode_source": "original_vlnce_episode",
         "reward_source": "live_habitat_geodesic_progress",
@@ -751,11 +825,43 @@ def _live_output_metadata(vlnce_metadata, *, policy_version):
         "dataset_role": args_cli.dataset_role,
         "policy_tag": args_cli.safe_policy_tag,
         "policy_version": policy_version,
+        "online_round": args_cli.online_round,
         "goal_radius_m": float(vlnce_metadata.goal_radius),
         "goal_stop_mode": args_cli.goal_stop_mode,
         "collection_policy": args_cli.collection_policy,
+        "online_oracle_enabled": bool(args_cli.allow_online_oracle),
         "missed_stop_patience": int(args_cli.missed_stop_patience),
         "vlnce_alignment": vlnce_metadata.alignment_record(),
+    }
+
+
+def _online_recovery_metadata(transitions, oracle_action, policy_action, executed_action):
+    """Tag closed-loop errors without adding privileged inputs to the policy."""
+    turn_streak = 0
+    for transition in reversed(transitions):
+        previous = transition.get("executed_action_id")
+        if not isinstance(previous, int) or not 0 <= previous <= 5:
+            break
+        turn_streak += 1
+    if 0 <= executed_action <= 5:
+        turn_streak += 1
+    if not isinstance(oracle_action, int):
+        category = "oracle_invalid"
+    elif 6 <= oracle_action <= 8 and 0 <= policy_action <= 5:
+        category = "forward_after_turn"
+    elif policy_action != oracle_action:
+        category = "action_mismatch"
+    else:
+        category = "action_match"
+    return {
+        "recovery_category": category,
+        "consecutive_turn_actions": turn_streak,
+        "online_dagger_eligible": bool(
+            isinstance(oracle_action, int)
+            and 0 <= oracle_action <= 9
+            and isinstance(policy_action, int)
+            and 0 <= policy_action <= 9
+        ),
     }
 
 
@@ -791,6 +897,7 @@ def run_safe_live_render_episode(
         missed_stop_penalty=args_cli.missed_stop_penalty,
         cost_limit=args_cli.safe_cost_limit,
         objective_config=safe_objective_config,
+        schema_version=LIVE_SCHEMA_VERSION,
     )
     goal_stop = GoalStopController(
         goal_radius=vlnce_metadata.goal_radius,
@@ -839,7 +946,11 @@ def run_safe_live_render_episode(
                 if reward_valid_before
                 else _measurement_distance(infos)
             )
-            oracle = current_frame_metadata.get("dynamic_oracle_action")
+            raw_oracle = current_frame_metadata.get("dynamic_oracle_action")
+            # The live shortest-path oracle is privileged.  Keep it entirely
+            # out of mainline VLM rollouts unless this process was explicitly
+            # launched as the online-Oracle ablation.
+            oracle = raw_oracle if args_cli.allow_online_oracle else None
             if args_cli.collection_policy == "oracle":
                 if not (
                     current_frame_metadata.get("oracle_valid", False)
@@ -895,6 +1006,7 @@ def run_safe_live_render_episode(
                         ),
                         "deterministic": True,
                     },
+                    timeout_seconds=args_cli.vlm_timeout_seconds,
                 )
             vlm_calls += 1
             policy_output = normalize_policy_response(response)
@@ -902,6 +1014,7 @@ def run_safe_live_render_episode(
                 policy_output["action_id"],
                 distance_before,
                 navigation_reward_valid=reward_valid_before,
+                action_probabilities=policy_output.get("action_probabilities"),
             )
             executed_action = action_from_id(stop_decision.executed_action_id)
             recorder.begin(policy_output, distance_before)
@@ -936,7 +1049,11 @@ def run_safe_live_render_episode(
                 command = torch.tensor(
                     executed_action.velocity_command, device=obs.device
                 )
-                env.begin_macro_action(command)
+                env.begin_macro_action(
+                    command,
+                    duration=executed_action.duration,
+                    action_id=executed_action.action_id,
+                )
                 for macro_step in range(1, requested_steps + 1):
                     obs, _, done, infos = env.step(command)
                     num_steps += 1
@@ -1027,6 +1144,13 @@ def run_safe_live_render_episode(
                 and policy_statistics_valid
                 and not stop_decision.shield_intervened
             )
+            actor_distillation_eligible = bool(
+                args_cli.dataset_role == "train"
+                and args_cli.collection_policy == "vlm"
+                and policy_output.get("policy_interface")
+                == POLICY_INTERFACE_NAVILA_GREEDY
+                and not policy_output.get("invalid_action", False)
+            )
             transition.update(
                 {
                     "schema_version": LIVE_SCHEMA_VERSION,
@@ -1041,23 +1165,32 @@ def run_safe_live_render_episode(
                     "history_sampling_policy": (
                         NAVILA_HISTORY_SAMPLING_POLICY
                     ),
-                    "history_padding_policy": "black_left",
+                    "history_padding_policy": "repeat_first",
                     "history_num_frames": NAVILA_VIDEO_FRAMES,
+                    # The current frame is pose-aligned; repeated history
+                    # entries are explicit padding, not synthetic black data.
                     "strict_observation_state_alignment": True,
                     "navigation_reward_valid": navigation_reward_valid,
                     "policy_statistics_valid": policy_statistics_valid,
                     "ppo_eligible": ppo_eligible,
                     "actor_eligible": ppo_eligible,
-                    "reward_critic_eligible": bool(
-                        navigation_reward_valid
-                        and not stop_decision.shield_intervened
+                    "actor_distillation_eligible": actor_distillation_eligible,
+                    "actor_teacher_action_id": stop_decision.policy_action_id,
+                    "actor_teacher_interface": policy_output.get(
+                        "policy_interface"
                     ),
-                    "cost_critic_eligible": not stop_decision.shield_intervened,
+                    "reward_critic_eligible": navigation_reward_valid,
+                    "cost_critic_eligible": True,
                     "oracle_valid": bool(
-                        current_frame_metadata.get("oracle_valid", False)
+                        args_cli.allow_online_oracle
+                        and current_frame_metadata.get("oracle_valid", False)
                     ),
+                    # The live navmesh oracle is diagnostic only.  It is not
+                    # an executable teacher because its action is not checked
+                    # against the Go2 controller outcome.
                     "oracle_eligible": bool(
-                        current_frame_metadata.get("oracle_valid", False)
+                        args_cli.allow_online_oracle
+                        and current_frame_metadata.get("oracle_valid", False)
                     ),
                     "dynamic_oracle_action": oracle,
                     "oracle_action_id": (
@@ -1078,7 +1211,11 @@ def run_safe_live_render_episode(
                     "goal_radius_m": float(vlnce_metadata.goal_radius),
                     "goal_stop_mode": args_cli.goal_stop_mode,
                     "collection_policy": args_cli.collection_policy,
+                    "online_oracle_enabled": bool(args_cli.allow_online_oracle),
                     "in_goal_radius": stop_decision.in_goal_radius,
+                    "goal_distance_valid": stop_decision.goal_distance_valid,
+                    "goal_gate_intervened": stop_decision.shield_intervened,
+                    "goal_gate_reason": stop_decision.goal_gate_reason,
                     "missed_stop": stop_decision.missed_stop,
                     "consecutive_missed_stops": (
                         stop_decision.consecutive_missed_stops
@@ -1097,6 +1234,13 @@ def run_safe_live_render_episode(
                     "reward_source": "live_habitat_geodesic_progress",
                     "navmesh_source": "locally_recomputed_habitat_sim_0.1.7",
                     "policy_tag": args_cli.safe_policy_tag,
+                    "online_round": args_cli.online_round,
+                    **_online_recovery_metadata(
+                        recorder.transitions[:-1],
+                        oracle.get("action_id") if isinstance(oracle, dict) else None,
+                        stop_decision.policy_action_id,
+                        stop_decision.executed_action_id,
+                    ),
                 }
             )
             transition["observation_key"] = (
@@ -1132,10 +1276,12 @@ def run_safe_live_render_episode(
             and not terminal
         ):
             termination_reason = "simulation_stopped"
-        if termination_reason in {"max_vlm_calls", "simulation_stopped"} and recorder.transitions:
-            recorder.transitions[-1]["done"] = True
-            recorder.transitions[-1]["truncated"] = True
-            recorder.transitions[-1]["termination_reason"] = termination_reason
+        if termination_reason == "simulation_stopped":
+            raise RuntimeError(
+                "Isaac simulation stopped before the live-render episode completed"
+            )
+        if termination_reason == "max_vlm_calls" and recorder.transitions:
+            recorder.truncate_last(termination_reason)
         recorder.finalize()
     except Exception:
         # No dataset writer has been opened yet, so the whole episode is
@@ -1336,6 +1482,7 @@ def run_safe_replay_episode(
                     "transition_index": len(recorder.transitions),
                     "deterministic": True,
                 },
+                timeout_seconds=args_cli.vlm_timeout_seconds,
             )
             vlm_calls += 1
             policy_output = normalize_policy_response(response)
@@ -1371,7 +1518,11 @@ def run_safe_replay_episode(
                 command = torch.tensor(
                     policy_output["velocity_command"], device=obs.device
                 )
-                env.begin_macro_action(command)
+                env.begin_macro_action(
+                    command,
+                    duration=policy_output["duration"],
+                    action_id=policy_output["action_id"],
+                )
                 for _ in range(requested_steps):
                     obs, _, done, infos = env.step(command)
                     num_steps += 1
@@ -1460,15 +1611,25 @@ def run_safe_replay_episode(
                 dataset_samples.append(
                     (transition["observation_key"], sampled_frames, transition)
                 )
-    finally:
-        if (
-            recorder.transitions
-            and not recorder.transitions[-1].get("done")
-            and termination_reason == "max_vlm_calls"
-        ):
-            recorder.transitions[-1]["done"] = True
-            recorder.transitions[-1]["truncated"] = True
-            recorder.transitions[-1]["termination_reason"] = termination_reason
+    except Exception:
+        # Samples are buffered in memory until the whole replay completes.
+        # Never publish the prefix of a failed physics/VLM run.
+        dataset_samples.clear()
+        raise
+    else:
+        if not recorder.transitions:
+            raise RuntimeError("Safe-Replay episode produced no transitions")
+        if not recorder.transitions[-1].get("done"):
+            if termination_reason == "max_vlm_calls":
+                recorder.truncate_last(termination_reason)
+            elif not simulation_app.is_running():
+                raise RuntimeError(
+                    "Isaac simulation stopped before Safe-Replay completed"
+                )
+            else:
+                raise RuntimeError(
+                    "Safe-Replay episode ended without a terminal transition"
+                )
         recorder.finalize()
         if dataset_writer is not None:
             for sample_key, frames, metadata in dataset_samples:
@@ -1488,6 +1649,13 @@ def run_safe_replay_episode(
 
 
 def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction, episode):
+    """Run the native Isaac-camera Safe-VLN episode.
+
+    The native-camera path uses the same goal-stop contract as live rendering:
+    the policy action is recorded, but sensor-gated fallback actions are what
+    the Go2 actually executes.  This keeps premature STOP decisions observable
+    without truncating every rollout at the first invalid stop.
+    """
     recorder = SafeTrajectoryRecorder(
         episode_id=episode["episode_id"],
         scene_id=episode["scene_id"],
@@ -1497,16 +1665,22 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
         step_penalty=args_cli.macro_step_penalty,
         success_reward=args_cli.success_reward,
         failed_stop_penalty=args_cli.failed_stop_penalty,
+        missed_stop_penalty=args_cli.missed_stop_penalty,
         cost_limit=args_cli.safe_cost_limit,
         objective_config=safe_objective_config,
+        schema_version=LIVE_SCHEMA_VERSION,
     )
-    dataset_writer = None
+    goal_stop = GoalStopController(
+        goal_radius=float(episode["goals"][0]["radius"]),
+        mode=args_cli.goal_stop_mode,
+        dataset_role=args_cli.dataset_role,
+        missed_stop_patience=args_cli.missed_stop_patience,
+    )
+    write_dataset = bool(args_cli.safe_dataset_dir)
     dataset_samples = []
-    if args_cli.safe_dataset_dir:
-        dataset_writer = SafeVLNShardWriter(
-            args_cli.safe_dataset_dir,
-            objective_config=safe_objective_config,
-        )
+    native_provenance = dict(
+        native_vlnce_payload_preflight["safe_vln_conversion"]
+    )
 
     step_dt = env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation
     steps_per_image = max(1, round(0.5 / step_dt))
@@ -1525,47 +1699,82 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
                 termination_reason = "max_vlm_calls"
                 break
 
-            sampled_frames = sample_eight_images(image_observations)
+            # Select once; send and persist this exact eight-frame history.
+            if len(image_observations) < NAVILA_VIDEO_FRAMES:
+                print(
+                    "Not enough images received; repeating the first valid frame.",
+                    flush=True,
+                )
+            # Native-camera and Habitat live-render inputs must share the
+            # official NaViLA full-history sampler before they are combined
+            # for Actor training.  The old linear sampler is kept only for
+            # legacy replay data and is rejected by the v5 Actor audit.
+            sampled_entries = sample_native_history(
+                image_observations,
+                num_frames=NAVILA_VIDEO_FRAMES,
+            )
+            sampled_frames = [entry["image"] for entry in sampled_entries]
             response = sample_images_and_send_to_vlm(
                 image_observations,
                 args_cli.vlm_host,
                 args_cli.vlm_port,
                 instruction.instruction_text,
                 request_metadata={
-                    "protocol_version": "safe-vln-go2-v2",
+                    "protocol_version": "safe-vln-go2-v5",
                     "mode": "act",
                     "episode_id": str(episode["episode_id"]),
                     "transition_index": len(recorder.transitions),
                     "deterministic": True,
                 },
+                sampled_images=sampled_frames,
+                timeout_seconds=args_cli.vlm_timeout_seconds,
             )
             vlm_calls += 1
             policy_output = normalize_policy_response(response)
-            action_text = policy_output["text"]
-            recorder.begin(policy_output, _measurement_distance(infos))
+            distance_before = _measurement_distance(infos)
+            navigation_reward_valid = bool(
+                math.isfinite(distance_before) and distance_before >= 0.0
+            )
+            stop_decision = goal_stop.resolve(
+                policy_output["action_id"],
+                distance_before,
+                navigation_reward_valid=navigation_reward_valid,
+                action_probabilities=policy_output.get("action_probabilities"),
+            )
+            executed_action = action_from_id(stop_decision.executed_action_id)
+            recorder.begin(policy_output, distance_before)
+            pose_before = _robot_pose(env)
             print(
-                f"Safe-VLN output: {response}\nAction {policy_output['action_id']}: {action_text}\n"
-                f"Command: {policy_output['velocity_command']}, duration: {policy_output['duration']:.2f}s\n",
+                f"Safe-VLN output: {response}\n"
+                f"Policy action {policy_output['action_id']}: {policy_output['text']}\n"
+                f"Executed action {executed_action.action_id}: {executed_action.text}"
+                + (" [GOAL GATE]\n" if stop_decision.shield_intervened else "\n")
+                + f"Command: {list(executed_action.velocity_command)}, "
+                f"duration: {executed_action.duration:.2f}s\n",
                 flush=True,
             )
 
-            if policy_output["action_id"] == 9:
-                env.set_stop_called(True)
-                env.measure_manager.update_measures()
-                infos["measurements"] = env.measure_manager.get_measurements()
-                success = bool(infos["measurements"]["success"])
-                recorder.finish(
-                    distance_after=_measurement_distance(infos),
-                    success=success,
-                    failed_stop=not success,
-                    terminated=True,
-                    termination_reason="success" if success else "failed_stop",
+            safety = infos.get("safety", {})
+            if stop_decision.immediate_terminal:
+                if stop_decision.success:
+                    env.set_stop_called(True)
+                    env.measure_manager.update_measures()
+                    infos["measurements"] = env.measure_manager.get_measurements()
+                success = bool(stop_decision.success)
+                termination_reason = stop_decision.termination_reason or (
+                    "success" if success else "failed_stop"
                 )
                 terminal = True
             else:
-                requested_steps = max(1, round(policy_output["duration"] / step_dt))
-                command = torch.tensor(policy_output["velocity_command"], device=obs.device)
-                env.begin_macro_action(command)
+                requested_steps = max(1, round(executed_action.duration / step_dt))
+                command = torch.tensor(
+                    executed_action.velocity_command, device=obs.device
+                )
+                env.begin_macro_action(
+                    command,
+                    duration=executed_action.duration,
+                    action_id=executed_action.action_id,
+                )
                 for _ in range(requested_steps):
                     obs, _, done, infos = env.step(command)
                     num_steps += 1
@@ -1574,12 +1783,24 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
 
                     if num_steps % steps_per_image == 0:
                         frame = infos["observations"]["camera_obs"][0, :, :, :3].cpu().numpy()
-                        image_observations.append(Image.fromarray(frame))
+                        image_observations.append(
+                            {
+                                "image": Image.fromarray(frame),
+                                "metadata": {
+                                    "frame_index": len(image_observations),
+                                    "physics_step": num_steps,
+                                    "isaac_pose": _robot_pose(env),
+                                    "camera_pose": _native_camera_pose(env),
+                                    "history_padding": False,
+                                    "strict_observation_state_alignment": True,
+                                },
+                            }
+                        )
                     if num_steps % steps_per_viz == 0:
                         camera_frame = infos["observations"]["camera_obs"][0, :, :, :3].cpu().numpy().copy()
                         viz_frame = infos["observations"]["viz_camera_obs"][0, :, :, :3].cpu().numpy().copy()
                         add_instruction_on_img(camera_frame, instruction.instruction_text)
-                        add_instruction_on_img(viz_frame, action_text)
+                        add_instruction_on_img(viz_frame, executed_action.text)
                         rgb_obses.append(np.concatenate([camera_frame, viz_frame], axis=1))
 
                     if safety.get("hard_violation", False):
@@ -1592,11 +1813,15 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
                         terminal = True
                         break
 
+                if not terminal and stop_decision.terminate_after_execution:
+                    terminal = True
+                    termination_reason = stop_decision.termination_reason
                 success = bool(infos["measurements"]["success"])
                 safety = infos.get("safety", {})
                 recorder.finish(
                     distance_after=_measurement_distance(infos),
                     success=success,
+                    missed_stop=bool(stop_decision.missed_stop),
                     unsafe_contact=bool(safety.get("unsafe_contact", False)),
                     fall=bool(safety.get("fall", False)),
                     blocked=bool(safety.get("blocked", False)),
@@ -1606,29 +1831,164 @@ def run_safe_episode(env, obs, infos, image_observations, rgb_obses, instruction
                     termination_reason=termination_reason,
                 )
 
-            transition = recorder.transitions[-1]
-            transition["episode_id"] = str(episode["episode_id"])
-            transition["scene_id"] = episode["scene_id"]
-            transition["instruction"] = instruction.instruction_text
-            transition["observation_key"] = f"episode{episode['episode_id']}/state{transition['index']:06d}"
-            transition["next_observation_key"] = (
-                None if transition["done"] else f"episode{episode['episode_id']}/state{transition['index'] + 1:06d}"
-            )
-            if dataset_writer is not None:
-                dataset_samples.append((transition["observation_key"], sampled_frames, transition))
-    finally:
-        if recorder.transitions and not recorder.transitions[-1].get("done") and termination_reason == "max_vlm_calls":
-            recorder.transitions[-1]["done"] = True
-            recorder.transitions[-1]["truncated"] = True
-            recorder.transitions[-1]["termination_reason"] = termination_reason
-        recorder.finalize()
-        if dataset_writer is not None:
-            for sample_key, frames, metadata in dataset_samples:
-                dataset_writer.add(sample_key, frames, metadata)
-            dataset_writer.close()
-            write_episode_summary(args_cli.safe_dataset_dir, recorder.to_dict(infos.get("measurements", {})))
-    return infos, rgb_obses, recorder
+            if stop_decision.immediate_terminal:
+                recorder.finish(
+                    distance_after=_measurement_distance(infos),
+                    success=success,
+                    failed_stop=bool(stop_decision.failed_stop),
+                    missed_stop=bool(stop_decision.missed_stop),
+                    unsafe_contact=bool(safety.get("unsafe_contact", False)),
+                    fall=bool(safety.get("fall", False)),
+                    blocked=bool(safety.get("blocked", False)),
+                    safety_diagnostics=safety,
+                    terminated=True,
+                    termination_reason=termination_reason,
+                )
 
+            transition = recorder.transitions[-1]
+            policy_statistics_valid = has_valid_policy_statistics(
+                policy_output,
+                objective_fingerprint=safe_objective_config.get("fingerprint"),
+            )
+            ppo_eligible = bool(
+                args_cli.dataset_role == "train"
+                and args_cli.collection_policy == "vlm"
+                and navigation_reward_valid
+                and policy_statistics_valid
+                and not stop_decision.shield_intervened
+            )
+            actor_distillation_eligible = bool(
+                args_cli.dataset_role == "train"
+                and args_cli.collection_policy == "vlm"
+                and policy_output.get("policy_interface")
+                == POLICY_INTERFACE_NAVILA_GREEDY
+                and not policy_output.get("invalid_action", False)
+            )
+            transition.update(
+                {
+                    "schema_version": LIVE_SCHEMA_VERSION,
+                    "dataset_role": args_cli.dataset_role,
+                    "vlnce_source_split": native_provenance["source_split"],
+                    "vlnce_source_dataset_role": native_provenance[
+                        "dataset_role"
+                    ],
+                    "vlnce_coordinate_system": native_provenance[
+                        "coordinate_system"
+                    ],
+                    "vlnce_source_metadata_sha256": native_provenance.get(
+                        "source_metadata_sha256"
+                    ),
+                    "vlnce_source_gt_sha256": native_provenance.get(
+                        "source_gt_sha256"
+                    ),
+                    "observation_alignment": "native_isaac_camera",
+                    "alignment_scope": "go2_native_camera_pose",
+                    "camera_pose_policy": "isaac_native_attached_camera",
+                    "history_sampling_policy": NAVILA_HISTORY_SAMPLING_POLICY,
+                    "history_padding_policy": "repeat_first",
+                    "history_num_frames": NAVILA_VIDEO_FRAMES,
+                    "history_padding_count": sum(
+                        bool(entry["metadata"].get("history_padding", False))
+                        for entry in sampled_entries
+                    ),
+                    "strict_observation_state_alignment": True,
+                    "frame_alignment": [
+                        entry["metadata"] for entry in sampled_entries
+                    ],
+                    "isaac_pose_before": pose_before,
+                    "isaac_pose_after": _robot_pose(env),
+                    "episode_id": str(episode["episode_id"]),
+                    "scene_id": episode["scene_id"],
+                    "instruction": instruction.instruction_text,
+                    "collection_policy": args_cli.collection_policy,
+                    "policy_tag": args_cli.safe_policy_tag,
+                    "online_round": args_cli.online_round,
+                    "online_oracle_enabled": False,
+                    "oracle_valid": False,
+                    "oracle_eligible": False,
+                    "oracle_action_id": None,
+                    "policy_action_id": stop_decision.policy_action_id,
+                    "policy_action_text": policy_output["text"],
+                    "executed_action_id": stop_decision.executed_action_id,
+                    "executed_action_text": executed_action.text,
+                    "executed_velocity_command": list(executed_action.velocity_command),
+                    "executed_duration": executed_action.duration,
+                    "goal_radius_m": float(episode["goals"][0]["radius"]),
+                    "goal_stop_mode": args_cli.goal_stop_mode,
+                    "in_goal_radius": stop_decision.in_goal_radius,
+                    "goal_distance_valid": stop_decision.goal_distance_valid,
+                    "goal_gate_intervened": stop_decision.shield_intervened,
+                    "shield_intervened": stop_decision.shield_intervened,
+                    "goal_gate_reason": stop_decision.goal_gate_reason,
+                    "missed_stop": stop_decision.missed_stop,
+                    "consecutive_missed_stops": stop_decision.consecutive_missed_stops,
+                    "policy_success": bool(
+                        stop_decision.policy_action_id == 9 and stop_decision.success
+                    ),
+                    "system_success": bool(success),
+                    "navigation_reward_valid": navigation_reward_valid,
+                    "policy_statistics_valid": policy_statistics_valid,
+                    "ppo_eligible": ppo_eligible,
+                    "actor_eligible": ppo_eligible,
+                    "actor_distillation_eligible": actor_distillation_eligible,
+                    "actor_teacher_action_id": stop_decision.policy_action_id,
+                    "actor_teacher_interface": policy_output.get(
+                        "policy_interface"
+                    ),
+                    "reward_critic_eligible": navigation_reward_valid,
+                    "cost_critic_eligible": True,
+                }
+            )
+            transition["observation_key"] = (
+                f"episode{episode['episode_id']}/state{transition['index']:06d}"
+            )
+            transition["next_observation_key"] = (
+                None
+                if transition["done"]
+                else f"episode{episode['episode_id']}/state{transition['index'] + 1:06d}"
+            )
+            if write_dataset:
+                dataset_samples.append(
+                    (transition["observation_key"], sampled_frames, transition)
+                )
+    except Exception:
+        # Never publish a partial episode when rendering, VLM inference, or
+        # physics raises.  The old flat writer committed whatever had been
+        # buffered from the failed run and made the dataset look complete.
+        dataset_samples.clear()
+        raise
+    if recorder.transitions and not recorder.transitions[-1].get("done"):
+        if termination_reason == "max_vlm_calls":
+            recorder.truncate_last(termination_reason)
+        elif not simulation_app.is_running():
+            raise RuntimeError(
+                "Isaac simulation stopped before the native-camera episode completed"
+            )
+        else:
+            raise RuntimeError(
+                "native-camera episode ended without a terminal transition"
+            )
+    recorder.finalize()
+    if write_dataset:
+        if not dataset_samples:
+            raise RuntimeError(
+                "native-camera episode produced no aligned transitions"
+            )
+        with SafeVLNEpisodeWriter(
+            args_cli.safe_dataset_dir,
+            episode["episode_id"],
+            dataset_role=args_cli.dataset_role,
+            split=args_cli.dataset_role,
+            schema_version=LIVE_SCHEMA_VERSION,
+            objective_config=safe_objective_config,
+        ) as writer:
+            for sample_key, frames, metadata in dataset_samples:
+                writer.add(sample_key, frames, metadata)
+        write_episode_summary(
+            args_cli.safe_dataset_dir,
+            recorder.to_dict(infos.get("measurements", {})),
+        )
+    return infos, rgb_obses, recorder
 
 def save_evaluation_outputs(
     env,
@@ -1708,10 +2068,10 @@ def main():
             flush=True,
         )
     else:
-        r2r_data_path = os.path.join(
-            ASSETS_DIR, "vln_ce_isaac_v1.json.gz"
-        )
-        all_episodes = read_episodes(r2r_data_path)
+        if args_cli.safe_vln:
+            all_episodes = native_vlnce_payload_preflight["episodes"]
+        else:
+            all_episodes = read_episodes(args_cli.r2r_data_path)
         episode = all_episodes[args_cli.episode_idx]
 
     env_cfg = parse_env_cfg(args_cli.task, num_envs=args_cli.num_envs)
@@ -1721,6 +2081,9 @@ def main():
         # high-level wrapper must observe and record the terminal Go2 pose first.
         env_cfg.terminations.base_contact = None
         env_cfg.terminations.bad_orientation = None
+        # The stock Go2 locomotion config disables PhysX contact processing for
+        # speed.  That makes a zero collision rate meaningless for Safe-VLN.
+        env_cfg.sim.disable_contact_processing = False
     if args_cli.safe_replay or args_cli.safe_live_render:
         # Offline replay and live Habitat rendering replace every high-level
         # Isaac RGB observation. Removing both sensors keeps RTX/viewport
@@ -1784,9 +2147,14 @@ def main():
                         orientation_limit=args_cli.safe_orientation_limit,
                         blocked_seconds=args_cli.safe_blocked_seconds,
                         blocked_distance=args_cli.safe_blocked_distance,
+                        turn_min_expected_angle=args_cli.safe_turn_min_expected_angle,
+                        turn_min_achieved_ratio=args_cli.safe_turn_min_achieved_ratio,
                         cost_profile=safe_cost_profile,
                         calibration_file=args_cli.safe_calibration_file,
-                        strict_start_alignment=args_cli.safe_live_render)
+                        strict_start_alignment=requires_strict_start_alignment(
+                            safe_vln=args_cli.safe_vln,
+                            safe_replay=args_cli.safe_replay,
+                        ))
     
     if not args_cli.safe_replay and not args_cli.safe_live_render:
         # set view pos and target
@@ -1895,7 +2263,22 @@ def main():
     # init_frame = cv2.rotate(init_frame, cv2.ROTATE_90_CLOCKWISE)
     instruction = InstructionData(**episode["instruction"])
     image_observations = []
-    image_observations.append(Image.fromarray(init_frame))
+    if args_cli.safe_vln:
+        image_observations.append(
+            {
+                "image": Image.fromarray(init_frame),
+                "metadata": {
+                    "frame_index": 0,
+                    "physics_step": 0,
+                    "isaac_pose": _robot_pose(env),
+                    "camera_pose": _native_camera_pose(env),
+                    "history_padding": False,
+                    "strict_observation_state_alignment": True,
+                },
+            }
+        )
+    else:
+        image_observations.append(Image.fromarray(init_frame))
 
     add_instruction_on_img(init_frame, instruction.instruction_text)
     vis_frame = infos["observations"]["viz_camera_obs"][0, :, :, :3].cpu().numpy()
@@ -1925,7 +2308,13 @@ def main():
         # run everything in inference mode
         with torch.inference_mode():
             if num_steps == target_steps:
-                stream_output = sample_images_and_send_to_vlm(image_observations, args_cli.vlm_host, args_cli.vlm_port, instruction.instruction_text)
+                stream_output = sample_images_and_send_to_vlm(
+                    image_observations,
+                    args_cli.vlm_host,
+                    args_cli.vlm_port,
+                    instruction.instruction_text,
+                    timeout_seconds=args_cli.vlm_timeout_seconds,
+                )
                 vlm_vel_commands, time_to_go = get_vel_command(stream_output)
                 env_steps_to_go = int(time_to_go / (
                     env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation

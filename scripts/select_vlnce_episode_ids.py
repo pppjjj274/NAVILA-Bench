@@ -4,41 +4,11 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
 import gzip
 import json
-import os
 from pathlib import Path
-import random
 
-
-def _scene_name(scene_id: str) -> str:
-    return os.path.splitext(os.path.basename(scene_id))[0]
-
-
-def balanced_episode_ids(episodes, *, seed: int) -> list[str]:
-    by_scene = defaultdict(list)
-    for episode in episodes:
-        by_scene[_scene_name(str(episode["scene_id"]))].append(
-            str(episode["episode_id"])
-        )
-    generator = random.Random(seed)
-    for scene_ids in by_scene.values():
-        generator.shuffle(scene_ids)
-    scenes = sorted(by_scene)
-    generator.shuffle(scenes)
-    ordered = []
-    round_index = 0
-    while True:
-        added = False
-        for scene in scenes:
-            if round_index < len(by_scene[scene]):
-                ordered.append(by_scene[scene][round_index])
-                added = True
-        if not added:
-            break
-        round_index += 1
-    return ordered
+from safe_vln.vlnce_dataset import balanced_episode_ids, scene_name
 
 
 def parse_args():
@@ -65,7 +35,7 @@ def main() -> int:
     episodes = payload.get("episodes")
     if not isinstance(episodes, list):
         raise ValueError(f"metadata has no episode list: {metadata_path}")
-    scene_count = len({_scene_name(str(item["scene_id"])) for item in episodes})
+    scene_count = len({scene_name(str(item["scene_id"])) for item in episodes})
     if (
         args.require_scene_count is not None
         and scene_count != args.require_scene_count

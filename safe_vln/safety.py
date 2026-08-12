@@ -67,6 +67,106 @@ class BlockedStatus:
     displacement: float
 
 
+@dataclass(frozen=True)
+class TurnExecutionStatus:
+    """Whether a commanded turn produced the expected yaw change."""
+
+    active: bool
+    blocked: bool
+    observed_steps: int
+    expected_angle: float
+    achieved_angle: float
+    execution_ratio: float
+    signed_yaw_delta: float = 0.0
+    expected_yaw_sign: int = 0
+    direction_mismatch: bool = False
+
+
+def wrap_angle_radians(value: float) -> float:
+    """Normalize an angle to ``[-pi, pi)``."""
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError("angle must be finite")
+    return (value + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def yaw_from_quaternion_wxyz(quaternion: torch.Tensor | Sequence[float]) -> float:
+    """Return planar yaw from an Isaac ``[w, x, y, z]`` quaternion."""
+    values = torch.as_tensor(quaternion, dtype=torch.float64).reshape(-1)
+    if values.numel() != 4 or not torch.isfinite(values).all():
+        raise ValueError("robot quaternion must contain four finite values")
+    norm = float(torch.linalg.vector_norm(values).item())
+    if norm <= 0.0:
+        raise ValueError("robot quaternion must be non-zero")
+    w, x, y, z = (float(item) / norm for item in values.tolist())
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def turn_execution_diagnostics(
+    command: torch.Tensor | Sequence[float],
+    *,
+    start_yaw: float | None,
+    current_yaw: float | None,
+    observed_steps: int,
+    expected_steps: int,
+    expected_angle: float,
+    min_expected_angle: float = 0.18,
+    minimum_execution_ratio: float = 0.25,
+) -> TurnExecutionStatus:
+    """Measure closed-loop turn execution without changing the 10 actions.
+
+    A turn is considered blocked only after its requested duration has elapsed.
+    The ratio is scaled by the requested angle so the 15/30/45 degree actions
+    use the same proportional criterion. ``min_expected_angle`` is only a
+    gate for whether to check a turn; it is not an absolute achieved-angle
+    requirement. This avoids labeling a partially executed small turn as
+    blocked merely because it falls below a fixed 0.18 radian floor.
+    """
+    command_tensor = torch.as_tensor(command, dtype=torch.float32).reshape(-1)
+    if command_tensor.numel() < 3:
+        raise ValueError("velocity command must contain vx, vy and wz")
+    yaw_rate = float(command_tensor[2].item())
+    expected = float(expected_angle)
+    if not all(math.isfinite(value) for value in (expected, min_expected_angle, minimum_execution_ratio)):
+        raise ValueError("turn execution thresholds must be finite")
+    if expected < 0.0 or min_expected_angle < 0.0 or not 0.0 <= minimum_execution_ratio <= 1.0:
+        raise ValueError("turn execution thresholds are out of range")
+    is_turn = abs(yaw_rate) > 1e-6 and expected_steps > 0 and start_yaw is not None
+    if not is_turn or current_yaw is None:
+        return TurnExecutionStatus(
+            active=False,
+            blocked=False,
+            observed_steps=int(observed_steps),
+            expected_angle=expected,
+            achieved_angle=0.0,
+            execution_ratio=0.0,
+        )
+    signed_delta = wrap_angle_radians(float(current_yaw) - float(start_yaw))
+    expected_sign = 1 if yaw_rate > 0.0 else -1
+    aligned_delta = signed_delta * expected_sign
+    achieved = max(0.0, aligned_delta)
+    opposite_angle = max(0.0, -aligned_delta)
+    ratio = achieved / max(expected, 1e-8)
+    active = int(observed_steps) < int(expected_steps)
+    direction_mismatch = bool(not active and opposite_angle > 0.02)
+    blocked = bool(
+        not active
+        and expected >= min_expected_angle
+        and achieved < expected * minimum_execution_ratio
+    )
+    return TurnExecutionStatus(
+        active=active,
+        blocked=blocked,
+        observed_steps=int(observed_steps),
+        expected_angle=expected,
+        achieved_angle=achieved,
+        execution_ratio=ratio,
+        signed_yaw_delta=signed_delta,
+        expected_yaw_sign=expected_sign,
+        direction_mismatch=direction_mismatch,
+    )
+
+
 class BlockedDetector:
     """Detect insufficient planar displacement during sustained forward commands."""
 
@@ -258,6 +358,7 @@ def combined_step_risk(components: dict[str, float], weights: dict[str, float]) 
 __all__ = [
     "BlockedDetector",
     "BlockedStatus",
+    "TurnExecutionStatus",
     "blocked_progress_risk",
     "combined_step_risk",
     "front_obstacle_distance",
@@ -266,5 +367,8 @@ __all__ = [
     "linear_risk",
     "orientation_angle",
     "smoothness_risk",
+    "turn_execution_diagnostics",
     "unsafe_contact_diagnostics",
+    "wrap_angle_radians",
+    "yaw_from_quaternion_wxyz",
 ]

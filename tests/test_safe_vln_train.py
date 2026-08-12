@@ -5,6 +5,11 @@ import pytest
 from safe_vln import train
 from safe_vln.live_render import LIVE_SCHEMA_VERSION
 from safe_vln.objective import build_objective_config, default_cost_profile
+from safe_vln.checkpoint import (
+    CHECKPOINT_ROLE_POLICY,
+    POLICY_INTERFACE_SAFE_DISCRETE,
+    SAFE_CHECKPOINT_CONTRACT_VERSION,
+)
 
 
 def _transition(episode_id, index, reward, cost, done):
@@ -225,12 +230,28 @@ def test_lagrange_inherits_checkpoint_unless_explicitly_overridden():
     ) == pytest.approx(0.2)
 
 
+def test_lagrange_is_updated_once_per_rollout_batch():
+    controller = train.LagrangeController(
+        cost_limit=0.25,
+        multiplier=0.1,
+        learning_rate=0.5,
+    )
+
+    before, after = train._update_lagrange_for_rollout(controller, 0.45)
+
+    assert before == pytest.approx(0.1)
+    assert after == pytest.approx(0.2)
+    assert controller.multiplier == pytest.approx(0.2)
+
+
 def test_actor_audit_contract_is_preserved_between_training_stages():
     source = {
         "actor/accepted": True,
         "actor/audit_stop_recall": 0.7,
         "actor/audit_false_stop_rate_non_goal": 0.03,
         "actor_architecture": "hierarchical-stop-motion",
+        "calibration_episode_ids": ["calibration"],
+        "audit_episode_ids": ["audit"],
         "stop_threshold": 0.5,
         "unrelated": "discard",
     }
@@ -240,5 +261,37 @@ def test_actor_audit_contract_is_preserved_between_training_stages():
     assert target["actor/audit_stop_recall"] == pytest.approx(0.7)
     assert target["actor/audit_false_stop_rate_non_goal"] == pytest.approx(0.03)
     assert target["actor_architecture"] == "hierarchical-stop-motion"
+    assert target["calibration_episode_ids"] == ["calibration"]
+    assert target["audit_episode_ids"] == ["audit"]
     assert target["stop_threshold"] == pytest.approx(0.5)
     assert "unrelated" not in target
+
+
+def test_policy_training_gate_rejects_missing_or_non_independent_audit():
+    with pytest.raises(RuntimeError, match="requires an independently audited"):
+        train._reject_failed_actor_audit({})
+
+    state = {
+        "checkpoint_contract_version": SAFE_CHECKPOINT_CONTRACT_VERSION,
+        "checkpoint_role": CHECKPOINT_ROLE_POLICY,
+        "policy_interface": POLICY_INTERFACE_SAFE_DISCRETE,
+        "actor/accepted": True,
+        "actor/audit_independent": False,
+        "actor/minimum_stop_accuracy": 0.5,
+        "actor/minimum_non_stop_macro_accuracy": 0.4,
+    }
+    with pytest.raises(RuntimeError, match="independent Actor audit"):
+        train._reject_failed_actor_audit(state)
+
+
+def test_strict_safety_observation_requires_contact_and_turn_diagnostics():
+    base = {
+        "action_id": 2,
+        "safety_diagnostics": {"contact_sensor_enabled": True},
+    }
+    assert not train._has_verified_safety_observation(base)
+    base["safety_diagnostics"]["turn_execution"] = {"blocked": False}
+    assert train._has_verified_safety_observation(base)
+    base["action_id"] = 9
+    del base["safety_diagnostics"]["turn_execution"]
+    assert train._has_verified_safety_observation(base)

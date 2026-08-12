@@ -12,9 +12,13 @@ from typing import Any, Mapping
 from .actions import ACTIONS
 
 
-SCHEMA_VERSION = "safe-vln-go2-v3"
-LEGACY_OBJECTIVE_SCHEMA_VERSIONS = frozenset({"safe-vln-go2-v2"})
+SCHEMA_VERSION = "safe-vln-go2-v4"
+LEGACY_OBJECTIVE_SCHEMA_VERSIONS = frozenset(
+    {"safe-vln-go2-v2", "safe-vln-go2-v3"}
+)
 COST_PROFILE_VERSION = "safe-vln-go2-cost-profile-v1"
+HARD_SAFETY_EVENTS = ("unsafe_contact", "fall", "blocked")
+COST_NORMALIZATION = "cumulative_episode_sum"
 
 REPLAY_REWARD_CONFIG = {
     "type": "graded_oracle_action",
@@ -71,6 +75,9 @@ DEFAULT_COST_PROFILE = {
         "peak_scale": 0.05,
         "max_dense_cost": 0.10,
     },
+    # SafeVLA constrains expected cumulative episode cost. Any hard event has
+    # unit cost, so the default limit rejects collision/fall/blocked episodes
+    # while leaving room for calibrated bounded dense-risk accumulation.
     "cost_limit": 0.25,
     "calibration": {
         "method": "defaults",
@@ -226,6 +233,8 @@ def build_objective_config(cost_profile: Mapping[str, Any]) -> dict[str, Any]:
     profile = validate_cost_profile(cost_profile)
     result = {
         "schema_version": SCHEMA_VERSION,
+        "hard_safety_events": list(HARD_SAFETY_EVENTS),
+        "cost_normalization": COST_NORMALIZATION,
         "replay_reward": deepcopy(REPLAY_REWARD_CONFIG),
         "online_reward": deepcopy(ONLINE_REWARD_CONFIG),
         "cost_profile": profile,
@@ -244,6 +253,17 @@ def validate_objective_config(config: Mapping[str, Any]) -> dict[str, Any]:
             f"{result.get('schema_version')!r}"
         )
     result["cost_profile"] = validate_cost_profile(result["cost_profile"])
+    if result.get("schema_version") == SCHEMA_VERSION:
+        if result.get("hard_safety_events") != list(HARD_SAFETY_EVENTS):
+            raise ValueError(
+                "Safe-VLN v4 hard_safety_events must be exactly "
+                f"{list(HARD_SAFETY_EVENTS)}"
+            )
+        if result.get("cost_normalization") != COST_NORMALIZATION:
+            raise ValueError(
+                "Safe-VLN v4 cost_normalization must be "
+                f"{COST_NORMALIZATION!r}"
+            )
     if not isinstance(result.get("replay_reward"), Mapping):
         raise ValueError("Safe-VLN replay_reward must be an object")
     if not isinstance(result.get("online_reward"), Mapping):
@@ -302,7 +322,9 @@ assert len(ACTIONS) == 10
 
 __all__ = [
     "COST_PROFILE_VERSION",
+    "COST_NORMALIZATION",
     "DEFAULT_COST_PROFILE",
+    "HARD_SAFETY_EVENTS",
     "LEGACY_OBJECTIVE_SCHEMA_VERSIONS",
     "ONLINE_REWARD_CONFIG",
     "REPLAY_REWARD_CONFIG",

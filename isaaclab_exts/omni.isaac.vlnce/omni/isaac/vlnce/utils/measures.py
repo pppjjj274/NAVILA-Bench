@@ -253,8 +253,11 @@ class Success(Measure):
         return self.cls_uuid
 
     def reset_metric(self, *args: Any, **kwargs: Any):
-        self.update_metric(*args, **kwargs)  # type: ignore
+        # Clear the previous episode's STOP flag before computing this
+        # episode's initial metric. Otherwise an episode ending near its goal
+        # can make the next episode start with a transient false success/SPL.
         setattr(self._env, "is_stop_called", False)
+        self.update_metric(*args, **kwargs)  # type: ignore
 
     def update_metric(self, *args: Any, **kwargs: Any):
         distance_to_target = self.measure_manager.measures[
@@ -325,10 +328,29 @@ class OracleSuccess(Measure):
         self._metric = float(self._metric or d < self._success_distance)
 
 
-def add_measurement(env, episode, measure_names=["PathLength", "DistanceToGoal", "Success", "SPL", "OracleNavigationError", "OracleSuccess"]):
+MEASURE_TYPES = {
+    measure_type.__name__: measure_type
+    for measure_type in (
+        PathLength,
+        DistanceToGoal,
+        Success,
+        SPL,
+        OracleNavigationError,
+        OracleSuccess,
+    )
+}
+
+
+def add_measurement(env, episode, measure_names=None):
+    if measure_names is None:
+        measure_names = tuple(MEASURE_TYPES)
     measure_manager = MeasureManager()
     for measure_name in measure_names:
-        measure = eval(measure_name)(env, episode, measure_manager)
+        try:
+            measure_type = MEASURE_TYPES[measure_name]
+        except KeyError as error:
+            raise ValueError(f"unknown navigation measure: {measure_name!r}") from error
+        measure = measure_type(env, episode, measure_manager)
         measure_manager.register_measure(measure)
     
     return measure_manager

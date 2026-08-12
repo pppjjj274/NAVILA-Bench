@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +7,8 @@ import torch
 from safe_vln.actions import ACTIONS
 from safe_vln.model import (
     ACTOR_ARCHITECTURE_HIERARCHICAL,
+    ACTOR_ARCHITECTURE_FACTORIZED,
+    FactorizedActorHead,
     HierarchicalActorHead,
     SafeActorCriticOutput,
     SafeNavilaActorCritic,
@@ -126,6 +129,21 @@ def test_actor_bypasses_navila_supervised_loss_forward():
     assert base_model.llm.model.calls == len(ACTIONS)
 
 
+def test_value_only_forward_does_not_score_ten_actor_candidates():
+    base_model = _NaVILAOuterModel()
+    model = SafeNavilaActorCritic(base_model, _Tokenizer())
+
+    values = model.forward_values(
+        torch.tensor([[2, -200, 3]]), images=[torch.zeros(1)]
+    )
+
+    assert values["reward_values"].shape == (1,)
+    assert values["cost_values"].shape == (1,)
+    assert base_model.prepared == 1
+    assert base_model.encoded == 1
+    assert base_model.llm.model.calls == 1
+
+
 def test_hierarchical_joint_probabilities_are_normalized():
     stop_logits = torch.tensor([torch.logit(torch.tensor(0.8))])
     motion_logits = torch.tensor([[2.0] + [0.0] * 8])
@@ -137,6 +155,23 @@ def test_hierarchical_joint_probabilities_are_normalized():
     assert probabilities.sum().item() == pytest.approx(1.0)
     assert probabilities[0, 9].item() == pytest.approx(0.8)
     assert probabilities[0, :9].sum().item() == pytest.approx(0.2)
+
+
+def test_factorized_joint_probabilities_are_normalized():
+    stop_logits = torch.tensor([torch.logit(torch.tensor(0.2))])
+    direction_logits = torch.tensor([[2.0, 0.0, 0.0]])
+    magnitude_logits = torch.zeros(1, 3, 3)
+    log_probs = FactorizedActorHead.joint_log_probs(
+        stop_logits, direction_logits, magnitude_logits
+    )
+    probabilities = log_probs.exp()
+    assert probabilities.shape == (1, 10)
+    assert probabilities.sum().item() == pytest.approx(1.0)
+    assert probabilities[0, 9].item() == pytest.approx(0.2)
+    motion = FactorizedActorHead.motion_log_probs(
+        direction_logits, magnitude_logits
+    ).exp()
+    assert motion.sum().item() == pytest.approx(1.0)
 
 
 def test_hierarchical_actor_uses_one_multimodal_forward():
@@ -154,6 +189,35 @@ def test_hierarchical_actor_uses_one_multimodal_forward():
     assert base_model.prepared == 1
     assert base_model.encoded == 1
     assert base_model.llm.model.calls == 1
+
+
+def test_factorized_actor_uses_one_multimodal_forward():
+    base_model = _NaVILAOuterModel()
+    model = SafeNavilaActorCritic(
+        base_model,
+        _Tokenizer(),
+        actor_architecture=ACTOR_ARCHITECTURE_FACTORIZED,
+    )
+    output = model(torch.tensor([[2, -200, 3]]), images=[torch.zeros(1)])
+
+    assert output.action_logits.shape == (1, len(ACTIONS))
+    assert output.stop_logits.shape == (1,)
+    assert output.motion_logits.shape == (1, 9)
+    assert output.direction_logits.shape == (1, 3)
+    assert output.magnitude_logits.shape == (1, 3, 3)
+    assert base_model.prepared == 1
+    assert base_model.encoded == 1
+    assert base_model.llm.model.calls == 1
+
+
+def test_factorized_action_mapping_is_direction_major():
+    direction = torch.tensor([[-10.0, -10.0, 10.0]])
+    magnitude = torch.full((1, 3, 3), -10.0)
+    magnitude[0, 2, 1] = 10.0
+    prediction = FactorizedActorHead.motion_log_probs(
+        direction, magnitude
+    ).argmax()
+    assert prediction == 7
 
 
 def test_hierarchical_deterministic_stop_threshold():
@@ -201,3 +265,24 @@ def test_hierarchical_checkpoint_saves_actor_contract(tmp_path):
     )
     restored.load_actor_head(tmp_path)
     restored.load_safe_heads(tmp_path)
+
+
+def test_factorized_checkpoint_saves_versioned_action_mapping(tmp_path):
+    model = SafeNavilaActorCritic(
+        _ExpandedPrefixModel(),
+        _Tokenizer(),
+        actor_architecture=ACTOR_ARCHITECTURE_FACTORIZED,
+        stop_threshold=0.63,
+    )
+    model.save_safe_heads(tmp_path)
+    config = json.loads(
+        (tmp_path / "actor_config.json").read_text(encoding="utf-8")
+    )
+    assert config["schema_version"] == 2
+    assert config["architecture"] == ACTOR_ARCHITECTURE_FACTORIZED
+    assert config["stop_threshold"] == pytest.approx(0.63)
+    assert config["action_factorization"]["action_mapping"] == [
+        [0, 1, 2],
+        [3, 4, 5],
+        [6, 7, 8],
+    ]

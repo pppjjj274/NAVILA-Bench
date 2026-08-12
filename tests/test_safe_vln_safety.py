@@ -14,7 +14,9 @@ from safe_vln.safety import (
     linear_risk,
     orientation_angle,
     smoothness_risk,
+    turn_execution_diagnostics,
     unsafe_contact_diagnostics,
+    yaw_from_quaternion_wxyz,
 )
 
 
@@ -137,6 +139,89 @@ def test_command_smoothness_ignores_first_action_and_stop():
     assert smoothness_risk(None, forward) == 0.0
     assert smoothness_risk(forward, torch.zeros(3)) == 0.0
     assert 0.0 < smoothness_risk(forward, turn) <= 1.0
+
+
+def test_turn_execution_detects_ineffective_completed_turn():
+    command = torch.tensor([0.0, 0.0, math.pi / 6.0])
+    status = turn_execution_diagnostics(
+        command,
+        start_yaw=0.0,
+        current_yaw=0.01,
+        observed_steps=75,
+        expected_steps=75,
+        expected_angle=math.pi / 4.0,
+    )
+    assert status.active is False
+    assert status.blocked is True
+    assert status.execution_ratio < 0.25
+
+
+def test_small_turn_uses_ratio_not_absolute_angle_floor():
+    command = torch.tensor([0.0, 0.0, math.pi / 6.0])
+    status = turn_execution_diagnostics(
+        command,
+        start_yaw=0.0,
+        current_yaw=0.13,
+        observed_steps=50,
+        expected_steps=50,
+        expected_angle=math.pi / 12.0,
+    )
+    assert status.execution_ratio == pytest.approx(0.13 / (math.pi / 12.0))
+    assert status.blocked is False
+
+
+def test_small_turn_still_detects_near_zero_yaw():
+    command = torch.tensor([0.0, 0.0, math.pi / 6.0])
+    status = turn_execution_diagnostics(
+        command,
+        start_yaw=0.0,
+        current_yaw=0.01,
+        observed_steps=50,
+        expected_steps=50,
+        expected_angle=math.pi / 12.0,
+    )
+    assert status.blocked is True
+
+
+def test_turn_execution_accepts_expected_yaw_change():
+    command = torch.tensor([0.0, 0.0, -math.pi / 6.0])
+    status = turn_execution_diagnostics(
+        command,
+        start_yaw=0.0,
+        current_yaw=-math.pi / 4.0,
+        observed_steps=75,
+        expected_steps=75,
+        expected_angle=math.pi / 4.0,
+    )
+    assert status.blocked is False
+    assert status.execution_ratio == pytest.approx(1.0)
+    assert status.signed_yaw_delta == pytest.approx(-math.pi / 4.0)
+    assert status.expected_yaw_sign == -1
+    assert status.direction_mismatch is False
+
+
+def test_turn_execution_reports_opposite_direction_without_changing_safety():
+    command = torch.tensor([0.0, 0.0, -math.pi / 6.0])
+    status = turn_execution_diagnostics(
+        command,
+        start_yaw=math.pi / 2.0,
+        current_yaw=math.pi / 2.0 + 0.23,
+        observed_steps=50,
+        expected_steps=50,
+        expected_angle=math.pi / 6.0,
+    )
+    assert status.signed_yaw_delta == pytest.approx(0.23)
+    assert status.expected_yaw_sign == -1
+    assert status.direction_mismatch is True
+    assert status.blocked is True
+
+
+def test_yaw_from_wxyz_identity_and_quarter_turn():
+    assert yaw_from_quaternion_wxyz([1.0, 0.0, 0.0, 0.0]) == pytest.approx(0.0)
+    half = math.sqrt(0.5)
+    assert yaw_from_quaternion_wxyz([half, 0.0, 0.0, half]) == pytest.approx(
+        math.pi / 2.0
+    )
 
 
 def test_front_obstacle_distance_filters_side_and_vertical_hits():

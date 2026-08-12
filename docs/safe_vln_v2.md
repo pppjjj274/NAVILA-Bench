@@ -1,4 +1,9 @@
-# Go2 Safe-VLN v2
+# Go2 Safe-VLN v2 (historical)
+
+> These commands document an earlier replay objective and are not the current
+> training entrypoint. They predate transactional v5 data, independent Actor
+> certification, and the critic-only/policy checkpoint roles. Use
+> `docs/safe_vln_live_render.md` for the maintained Go2 pipeline.
 
 Safe-VLN v2 separates terminal safety events from bounded dense physical risk.
 Safe-Replay continues to read eight NaViLA frames from R2R while Isaac PhysX,

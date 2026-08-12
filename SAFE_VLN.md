@@ -1,4 +1,10 @@
-# Go2 Safe-VLN
+# Go2 Safe-VLN (historical v1 notes)
+
+> This document describes the retired v1/replay workflow and is retained only
+> for provenance. A critic-only checkpoint must **not** be served as a
+> replacement policy or passed directly to constrained PPO. Use
+> `docs/safe_vln_live_render.md` and the strict v5 checkpoint/data contracts
+> for current Go2 experiments.
 
 This extension adds safety-aware hierarchical navigation to NaVILA-Bench:
 
@@ -105,43 +111,17 @@ Complete training samples are written atomically as tar shards containing eight 
 
 ## Training
 
-First collect data with a legacy server, then warm-start independent critics in the `navila` environment:
+The original commands in this retired note served a critic-only checkpoint as
+a stochastic Actor and then used those samples for PPO. That path is invalid
+and is now rejected by checkpoint-role and policy-statistics validation. A
+critic-only checkpoint may provide values while the unchanged deterministic
+NaViLA policy supplies actions; it is not a replacement policy.
 
-```bash
-python scripts/safe_vln_main.py warmup-critics \
-  --model-path $HOME/NaVILA/checkpoints/navila-llama3-8b-8f \
-  --dataset-dir outputs/safe_vln_dataset \
-  --output-dir outputs/critic_warmup \
-  --epochs 1
-```
-
-Start stochastic structured inference with the warm checkpoint, then collect fresh on-policy data from the `vlnce-isaac` environment:
-
-```bash
-python scripts/vlm_server.py \
-  --model_path $HOME/NaVILA/checkpoints/navila-llama3-8b-8f \
-  --safe_checkpoint outputs/critic_warmup \
-  --no-safe_deterministic
-
-python scripts/safe_vln_main.py collect \
-  --dataset-dir outputs/on_policy_v0 \
-  --start-idx 0 --end-idx 100
-```
-
-Run constrained PPO back in the `navila` environment:
-
-```bash
-python scripts/safe_vln_main.py train \
-  --model-path $HOME/NaVILA/checkpoints/navila-llama3-8b-8f \
-  --checkpoint outputs/critic_warmup \
-  --rollout-dir outputs/on_policy_v0 \
-  --output-dir outputs/policy_v1 \
-  --cost-limit 0.1 \
-  --gamma 0.99 \
-  --gae-lambda 0.95
-```
-
-Re-collect rollouts after every policy update. The trainer rejects samples lacking the structured `old_log_prob`, `reward_value`, or `cost_value`, preventing legacy data from being treated as on-policy PPO data.
+Use the current, executable native-camera sequence in
+[`docs/safe_vln_live_render.md`](docs/safe_vln_live_render.md): collect and
+audit official 61-scene train episodes, distill and independently certify the
+discrete Actor, collect a fresh on-policy batch from that exact certified
+policy, and only then run constrained PPO.
 
 Aggregate episode metrics:
 
@@ -159,7 +139,7 @@ The summary includes success/SPL, safe success, safe SPL, cumulative cost, colli
 - blocked window: `2.0 s` (100 steps at the current `0.02 s` control period)
 - blocked displacement threshold: `0.10 m`
 - reward discount / GAE lambda: `0.99 / 0.95`
-- training/evaluation cost limits: `0.1 / 0.0`
+- default cumulative episode cost limit: `0.25`
 - PPO clip: `0.1`
 - Lagrange learning rate: `0.035`
 - LoRA rank/alpha/dropout: `16 / 32 / 0.05`

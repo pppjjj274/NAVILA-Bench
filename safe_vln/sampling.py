@@ -101,12 +101,23 @@ def _round_robin_buckets(
             return
 
 
-def sampling_summary(items: Sequence[Any]) -> dict[str, Any]:
+def sampling_summary(
+    items: Sequence[Any],
+    *,
+    action_field: str = "oracle_action_id",
+) -> dict[str, Any]:
+    if not action_field:
+        raise ValueError("sampling summary action_field must be non-empty")
     metadata = [_metadata(item) for item in items]
+    missing = [item for item in metadata if item.get(action_field) is None]
+    if missing:
+        raise ValueError(
+            f"sampling summary requires {action_field!r} on every item; "
+            f"missing from {len(missing)} of {len(metadata)} items"
+        )
     actions = Counter(
-        int(item["oracle_action_id"])
+        int(item[action_field])
         for item in metadata
-        if item.get("oracle_action_id") is not None
     )
     return {
         "samples": len(items),
@@ -354,3 +365,89 @@ def select_balanced_ppo(
         seed=seed,
         namespace="ppo-training-order",
     )
+
+
+def select_risk_episodes(
+    items: Iterable[Any], *, per_stratum: int = 20, max_per_scene: int = 2
+) -> list[dict[str, Any]]:
+    """Select a deterministic Safety-CHORES-style episode mix from metadata."""
+    if per_stratum <= 0 or max_per_scene <= 0:
+        raise ValueError("risk selection limits must be positive")
+    episodes: dict[str, dict[str, Any]] = {}
+    for item in items:
+        metadata = _metadata(item)
+        episode_id = str(metadata.get("episode_id"))
+        stats = episodes.setdefault(
+            episode_id,
+            {
+                "episode_id": episode_id,
+                "scene_id": str(metadata.get("scene_id")),
+                "cumulative_cost": 0.0,
+                "hard_events": 0,
+                "near_obstacle_score": 0.0,
+                "maneuver_risk_score": 0.0,
+            },
+        )
+        components = metadata.get("cost_components") or {}
+        risk = components.get("risk_component_peaks") or {}
+        stats["cumulative_cost"] += float(metadata.get("cost", 0.0) or 0.0)
+        stats["hard_events"] += int(bool(metadata.get("hard_violation", False)))
+        stats["near_obstacle_score"] = max(
+            stats["near_obstacle_score"],
+            float(risk.get("near_obstacle", 0.0) or 0.0)
+            + float(risk.get("speed_near", 0.0) or 0.0),
+        )
+        stats["maneuver_risk_score"] = max(
+            stats["maneuver_risk_score"],
+            float(risk.get("blocked", 0.0) or 0.0)
+            + float(risk.get("tilt", 0.0) or 0.0)
+            + float(risk.get("smoothness", 0.0) or 0.0),
+        )
+    required = 4 * per_stratum
+    if len(episodes) < required:
+        raise ValueError(f"risk selection needs {required} episodes, found {len(episodes)}")
+
+    candidates = list(episodes.values())
+    orderings = {
+        "hard": sorted(
+            candidates,
+            key=lambda row: (-row["hard_events"], -row["cumulative_cost"], row["episode_id"]),
+        ),
+        "near_obstacle": sorted(
+            candidates,
+            key=lambda row: (-row["near_obstacle_score"], -row["cumulative_cost"], row["episode_id"]),
+        ),
+        "maneuver": sorted(
+            candidates,
+            key=lambda row: (-row["maneuver_risk_score"], -row["cumulative_cost"], row["episode_id"]),
+        ),
+        "control": sorted(
+            candidates,
+            key=lambda row: (row["hard_events"], row["cumulative_cost"], row["episode_id"]),
+        ),
+    }
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    scene_counts: Counter[str] = Counter()
+    for stratum, ordered in orderings.items():
+        chosen = []
+        for enforce_scene_limit in (True, False):
+            for row in ordered:
+                if row["episode_id"] in selected_ids:
+                    continue
+                if enforce_scene_limit and scene_counts[row["scene_id"]] >= max_per_scene:
+                    continue
+                record = dict(row)
+                record["risk_stratum"] = stratum
+                record["scene_limit_relaxed"] = not enforce_scene_limit
+                chosen.append(record)
+                selected.append(record)
+                selected_ids.add(row["episode_id"])
+                scene_counts[row["scene_id"]] += 1
+                if len(chosen) == per_stratum:
+                    break
+            if len(chosen) == per_stratum:
+                break
+        if len(chosen) != per_stratum:
+            raise RuntimeError(f"could not fill risk stratum {stratum!r}")
+    return selected

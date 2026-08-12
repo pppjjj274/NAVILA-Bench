@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
-
 import torch
 import torch.nn.functional as F
 
@@ -135,7 +133,18 @@ class SafePPOOptimizer:
         self.optimizer = optimizer
         self.config = config or PPOConfig()
 
-    def step(self, batch: dict[str, torch.Tensor], lagrange_multiplier: float):
+    def begin_accumulation(self) -> None:
+        """Start one optimizer update composed of several micro-batches."""
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def accumulate(
+        self,
+        batch: dict[str, torch.Tensor],
+        lagrange_multiplier: float,
+        *,
+        gradient_scale: float = 1.0,
+    ):
+        """Backpropagate one micro-batch without changing the policy."""
         loss, stats = constrained_ppo_loss(
             **batch,
             lagrange_multiplier=lagrange_multiplier,
@@ -144,9 +153,19 @@ class SafePPOOptimizer:
         )
         if not torch.isfinite(loss):
             raise FloatingPointError("Safe-VLN PPO loss is not finite")
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        parameters = [parameter for group in self.optimizer.param_groups for parameter in group["params"]]
+        scale = float(gradient_scale)
+        if not 0.0 < scale <= 1.0:
+            raise ValueError("gradient_scale must be in (0, 1]")
+        (loss * scale).backward()
+        return stats
+
+    def finish_accumulation(self):
+        """Clip gradients and apply the accumulated optimizer update."""
+        parameters = [
+            parameter
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        ]
         grad_norm = torch.nn.utils.clip_grad_norm_(
             parameters, self.config.max_grad_norm
         )
@@ -156,7 +175,6 @@ class SafePPOOptimizer:
                 "Safe-VLN PPO gradient norm is not finite; "
                 "use BF16 training or lower the learning rate"
             )
-        stats["optimizer/grad_norm"] = float(grad_norm.detach().item())
         self.optimizer.step()
         if any(
             not torch.isfinite(parameter).all()
@@ -168,4 +186,10 @@ class SafePPOOptimizer:
                 "Safe-VLN PPO produced non-finite trainable parameters"
             )
         self.optimizer.zero_grad(set_to_none=True)
+        return float(grad_norm.detach().item())
+
+    def step(self, batch: dict[str, torch.Tensor], lagrange_multiplier: float):
+        self.begin_accumulation()
+        stats = self.accumulate(batch, lagrange_multiplier)
+        stats["optimizer/grad_norm"] = self.finish_accumulation()
         return stats

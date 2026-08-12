@@ -10,12 +10,26 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from .actor_training import split_actor_partitions
+from .actions import has_valid_policy_statistics
+from .checkpoint import (
+    CHECKPOINT_ROLE_DIAGNOSTIC,
+    CHECKPOINT_ROLE_POLICY,
+    POLICY_INTERFACE_SAFE_DISCRETE,
+    SAFE_CHECKPOINT_CONTRACT_VERSION,
+    require_safe_policy_checkpoint,
+    safe_checkpoint_contract,
+)
 from .cmdp import LagrangeController, compute_gae
 from .dataset import iter_sample_refs, iter_samples, load_sample_refs
 from .learner import evaluate_selected_actions, save_checkpoint, train_critic_epoch
 from .live_render import LEGACY_LIVE_SCHEMA_VERSIONS, LIVE_SCHEMA_VERSION
 from .navila import load_safe_navila
-from .objective import validate_objective_config
+from .objective import (
+    COST_NORMALIZATION,
+    SCHEMA_VERSION,
+    validate_objective_config,
+)
 from .sampling import (
     deterministic_shuffle,
     sampling_summary,
@@ -54,26 +68,39 @@ def _checkpoint_state(checkpoint):
     return _read_json(Path(checkpoint) / "trainer_state.json") if checkpoint else {}
 
 
+def _require_new_output_dir(output_dir):
+    path = Path(output_dir)
+    if path.exists() and any(path.iterdir()):
+        raise ValueError(f"refusing to overwrite training output: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _reject_failed_actor_audit(checkpoint_state):
-    if checkpoint_state.get("actor/accepted") is False:
-        raise RuntimeError(
-            "checkpoint failed its actor audit and cannot be used for later stages"
-        )
+    """Backward-compatible name for the fail-closed policy gate."""
+
+    return require_safe_policy_checkpoint(
+        checkpoint_state, context="Safe-VLN policy training"
+    )
 
 
 def _copy_actor_contract(target, checkpoint_state):
     for key, value in checkpoint_state.items():
         if key.startswith("actor/") or key in {
             "actor_architecture",
+            "audit_episode_ids",
+            "calibration_episode_ids",
+            "checkpoint_contract_version",
+            "checkpoint_role",
+            "policy_interface",
             "stop_threshold",
         }:
             target[key] = value
 
 
-def _validate_objective_compatibility(manifest, checkpoint_state):
+def _validate_dataset_objective(manifest):
     schema = manifest.get("schema_version")
     dataset_fingerprint = manifest.get("objective_fingerprint")
-    checkpoint_fingerprint = checkpoint_state.get("objective_fingerprint")
     if schema in VERSIONED_DATASET_SCHEMAS:
         if not dataset_fingerprint:
             raise RuntimeError("versioned rollout manifest has no objective fingerprint")
@@ -88,11 +115,31 @@ def _validate_objective_compatibility(manifest, checkpoint_state):
             raise RuntimeError(
                 "versioned rollout manifest fingerprint does not match its objective"
             )
+        if (
+            schema == LIVE_SCHEMA_VERSION
+            and validated_objective.get("schema_version") != SCHEMA_VERSION
+        ):
+            raise RuntimeError(
+                f"{LIVE_SCHEMA_VERSION} data requires the current "
+                f"{SCHEMA_VERSION} objective contract"
+            )
+        return validated_objective
+    if dataset_fingerprint:
+        raise RuntimeError("legacy v1 data cannot be mixed with a versioned objective")
+    return None
+
+
+def _validate_objective_compatibility(manifest, checkpoint_state):
+    schema = manifest.get("schema_version")
+    dataset_fingerprint = manifest.get("objective_fingerprint")
+    checkpoint_fingerprint = checkpoint_state.get("objective_fingerprint")
+    _validate_dataset_objective(manifest)
+    if schema in VERSIONED_DATASET_SCHEMAS:
         if checkpoint_fingerprint != dataset_fingerprint:
             raise RuntimeError(
                 "checkpoint and rollout objective fingerprints do not match"
             )
-    elif dataset_fingerprint or checkpoint_fingerprint:
+    elif checkpoint_fingerprint:
         raise RuntimeError("legacy v1 data cannot be mixed with a versioned objective")
     return schema, dataset_fingerprint
 
@@ -147,10 +194,41 @@ def _initial_lagrange_multiplier(args, checkpoint_state):
     return value
 
 
+def _update_lagrange_for_rollout(controller, mean_episode_cost):
+    """Apply exactly one dual update for one immutable rollout batch."""
+
+    before = float(controller.multiplier)
+    after = float(controller.update(mean_episode_cost))
+    return before, after
+
+
+def _has_verified_safety_observation(metadata) -> bool:
+    """Reject rollouts collected before contact/turn sensors were validated."""
+    diagnostics = metadata.get("safety_diagnostics")
+    if not isinstance(diagnostics, dict):
+        return False
+    if diagnostics.get("contact_sensor_enabled") is not True:
+        return False
+    action_id = metadata.get("action_id")
+    try:
+        action_id = None if action_id is None else int(action_id)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if action_id is not None and 0 <= action_id <= 8:
+        if not isinstance(diagnostics.get("turn_execution"), dict):
+            return False
+    return True
+
+
 def _warmup_actor_candidate(args):
     """Legacy candidate-scoring behavior cloning on strictly aligned dynamic-oracle samples."""
+    if getattr(args, "actor_target_source", "oracle") != "oracle":
+        raise ValueError(
+            "--actor-target-source=navila-policy requires a hierarchical Actor"
+        )
     if getattr(args, "checkpoint", None):
         raise ValueError("warmup-actor starts from fresh NaViLA LoRA; omit --checkpoint")
+    _require_new_output_dir(args.output_dir)
     if args.actor_lr <= 0:
         raise ValueError("--actor-lr must be positive")
     if args.oracle_stop_weight <= 0:
@@ -164,8 +242,8 @@ def _warmup_actor_candidate(args):
         "minimum_non_stop_macro_accuracy",
     ):
         value = float(getattr(args, name, 0.0))
-        if not 0.0 <= value <= 1.0:
-            raise ValueError(f"--{name.replace('_', '-')} must be in [0, 1]")
+        if not 0.0 < value <= 1.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be in (0, 1]")
     manifest = _dataset_manifest(args.dataset_dir)
     if manifest.get("dataset_role") != "train":
         raise RuntimeError("actor warmup requires a training dataset")
@@ -173,6 +251,7 @@ def _warmup_actor_candidate(args):
         raise RuntimeError(
             f"actor warmup requires {LIVE_SCHEMA_VERSION} strict live-render data"
         )
+    _validate_dataset_objective(manifest)
     objective_fingerprint = manifest.get("objective_fingerprint")
     if not objective_fingerprint:
         raise RuntimeError("actor warmup dataset has no objective fingerprint")
@@ -203,6 +282,8 @@ def _warmup_actor_candidate(args):
             raise RuntimeError(
                 "actor warmup sample objective fingerprint does not match manifest"
             )
+        if not _has_verified_safety_observation(metadata):
+            return False
         if not bool(metadata.get("oracle_eligible", False)):
             return False
         oracle_action_id = metadata.get("oracle_action_id")
@@ -210,35 +291,45 @@ def _warmup_actor_candidate(args):
             return False
         return True
 
+    eligible_refs = [
+        ref
+        for ref in iter_sample_refs(args.dataset_dir, args.split)
+        if validate_metadata(ref.metadata)
+    ]
+    if not eligible_refs:
+        raise RuntimeError("actor warmup found no oracle-eligible samples")
+    audit_episodes_per_scene = (
+        args.dev_episodes_per_scene
+        if getattr(args, "dev_episodes_per_scene", None) is not None
+        else args.audit_episodes_per_scene
+    )
+    train_refs, calibration_refs, audit_refs = split_actor_partitions(
+        eligible_refs,
+        seed=int(getattr(args, "sampling_seed", 20260729)),
+        calibration_episodes_per_scene=args.calibration_episodes_per_scene,
+        audit_episodes_per_scene=audit_episodes_per_scene,
+    )
+
     sampling_strategy = getattr(args, "sampling_strategy", "sequential")
     sampling_seed = int(getattr(args, "sampling_seed", 20260729))
     if sampling_strategy == "balanced-oracle":
-        refs = [
-            ref
-            for ref in iter_sample_refs(args.dataset_dir, args.split)
-            if validate_metadata(ref.metadata)
-        ]
         selected_refs = select_balanced_oracle(
-            refs,
+            train_refs,
             max_samples=args.max_samples,
             seed=sampling_seed,
         )
-        samples = load_sample_refs(selected_refs)
     elif sampling_strategy == "sequential":
-        samples = []
-        for frames, metadata in iter_samples(args.dataset_dir, args.split):
-            if not validate_metadata(metadata):
-                continue
-            samples.append((frames, metadata))
-            if args.max_samples is not None and len(samples) >= args.max_samples:
-                break
+        selected_refs = train_refs[
+            : args.max_samples if args.max_samples is not None else None
+        ]
     else:
         raise ValueError(
             "warmup-actor supports --sampling-strategy=sequential or "
             "balanced-oracle"
         )
+    samples = load_sample_refs(selected_refs)
     if not samples:
-        raise RuntimeError("actor warmup found no oracle-eligible samples")
+        raise RuntimeError("actor warmup selected no training samples")
     sample_stats = sampling_summary(samples)
     print(
         json.dumps(
@@ -260,10 +351,26 @@ def _warmup_actor_candidate(args):
         "objective_config": manifest.get("objective_config"),
         "policy_version": 0,
         "fresh_lora": True,
+        "actor_architecture": "candidate-scoring",
         "oracle_stop_weight": float(args.oracle_stop_weight),
         "sampling_strategy": sampling_strategy,
         "sampling_seed": sampling_seed,
         "sampling": sample_stats,
+        "train_episodes": len(
+            {str(ref.metadata.get("episode_id")) for ref in train_refs}
+        ),
+        "calibration_episodes": len(
+            {str(ref.metadata.get("episode_id")) for ref in calibration_refs}
+        ),
+        "audit_episodes": len(
+            {str(ref.metadata.get("episode_id")) for ref in audit_refs}
+        ),
+        "calibration_episode_ids": sorted(
+            {str(ref.metadata.get("episode_id")) for ref in calibration_refs}
+        ),
+        "audit_episode_ids": sorted(
+            {str(ref.metadata.get("episode_id")) for ref in audit_refs}
+        ),
     }
     update = 0
     for epoch in range(args.epochs):
@@ -334,8 +441,9 @@ def _warmup_actor_candidate(args):
     model.eval()
     class_samples: dict[int, int] = defaultdict(int)
     class_correct: dict[int, int] = defaultdict(int)
+    audit_samples = load_sample_refs(audit_refs)
     with torch.no_grad():
-        for frames, metadata in samples:
+        for frames, metadata in audit_samples:
             prepared = preprocessor(frames, metadata["instruction"])
             output = model(prepared.input_ids, images=prepared.images)
             target_id = int(metadata["oracle_action_id"])
@@ -363,8 +471,12 @@ def _warmup_actor_candidate(args):
     minimum_non_stop_macro_accuracy = float(
         getattr(args, "minimum_non_stop_macro_accuracy", 0.4)
     )
+    all_action_classes_present = all(
+        str(action_id) in per_class_accuracy for action_id in range(10)
+    )
     accepted = (
-        stop_accuracy is not None
+        all_action_classes_present
+        and stop_accuracy is not None
         and stop_accuracy >= minimum_stop_accuracy
         and non_stop_macro_accuracy is not None
         and non_stop_macro_accuracy >= minimum_non_stop_macro_accuracy
@@ -378,11 +490,23 @@ def _warmup_actor_candidate(args):
             "actor/audit_per_class_accuracy": per_class_accuracy,
             "actor/audit_stop_accuracy": stop_accuracy,
             "actor/audit_non_stop_macro_accuracy": non_stop_macro_accuracy,
+            "actor/audit_samples": len(audit_samples),
+            "actor/audit_independent": True,
+            "actor/audit_target_source": "dynamic-oracle",
+            "actor/goal_stop_contract": "policy-v1",
+            "actor/audit_all_action_classes_present": all_action_classes_present,
             "actor/minimum_stop_accuracy": minimum_stop_accuracy,
             "actor/minimum_non_stop_macro_accuracy": (
                 minimum_non_stop_macro_accuracy
             ),
             "actor/accepted": accepted,
+            "checkpoint_contract_version": SAFE_CHECKPOINT_CONTRACT_VERSION,
+            "checkpoint_role": (
+                CHECKPOINT_ROLE_POLICY
+                if accepted
+                else CHECKPOINT_ROLE_DIAGNOSTIC
+            ),
+            "policy_interface": POLICY_INTERFACE_SAFE_DISCRETE,
         }
     )
     print(json.dumps({"mode": "warmup-actor-audit", **state}), flush=True)
@@ -398,11 +522,14 @@ def _warmup_actor_candidate(args):
 def warmup_actor(args):
     """Train either the v5 hierarchical actor or a legacy candidate actor."""
     architecture = getattr(
-        args, "actor_architecture", "hierarchical-stop-motion"
+        args, "actor_architecture", "candidate-scoring"
     )
     if architecture == "candidate-scoring":
         return _warmup_actor_candidate(args)
-    if architecture != "hierarchical-stop-motion":
+    if architecture not in {
+        "hierarchical-stop-motion",
+        "hierarchical-stop-direction-magnitude",
+    }:
         raise ValueError(f"unsupported actor architecture: {architecture}")
     manifest = _dataset_manifest(args.dataset_dir)
     if manifest.get("dataset_role") != "train":
@@ -411,6 +538,7 @@ def warmup_actor(args):
         raise RuntimeError(
             f"hierarchical actor requires {LIVE_SCHEMA_VERSION} data"
         )
+    _validate_dataset_objective(manifest)
     if not manifest.get("objective_fingerprint"):
         raise RuntimeError("actor warmup dataset has no objective fingerprint")
     from .actor_pipeline import warmup_hierarchical_actor
@@ -420,16 +548,62 @@ def warmup_actor(args):
     )
 
 
+def audit_actor(args):
+    """Run a read-only diagnostic audit for a hierarchical checkpoint."""
+    manifest = _dataset_manifest(args.dataset_dir)
+    if manifest.get("dataset_role") != "train":
+        raise RuntimeError("actor audit requires a training dataset")
+    if manifest.get("schema_version") != LIVE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"actor audit requires {LIVE_SCHEMA_VERSION} data"
+        )
+    _validate_dataset_objective(manifest)
+    if not manifest.get("objective_fingerprint"):
+        raise RuntimeError("actor audit dataset has no objective fingerprint")
+    from .actor_pipeline import diagnose_hierarchical_actor
+
+    return diagnose_hierarchical_actor(
+        args, manifest, _training_dtype(args)
+    )
+
+
+def dagger_actor(args):
+    """Fine-tune a certified Actor from strict on-policy recovery rollouts."""
+    rollout_manifest = _dataset_manifest(args.rollout_dir)
+    anchor_manifest = _dataset_manifest(args.anchor_dataset_dir)
+    checkpoint_state = _checkpoint_state(args.checkpoint)
+    if rollout_manifest.get("dataset_role") != "train":
+        raise RuntimeError("online DAgger rollouts must be training data")
+    if anchor_manifest.get("dataset_role") != "train":
+        raise RuntimeError("online DAgger anchors must be training data")
+    if rollout_manifest.get("schema_version") != LIVE_SCHEMA_VERSION:
+        raise RuntimeError("online DAgger requires strict live-render rollouts")
+    if anchor_manifest.get("schema_version") != LIVE_SCHEMA_VERSION:
+        raise RuntimeError("online DAgger requires strict live-render anchors")
+    _validate_objective_compatibility(rollout_manifest, checkpoint_state)
+    _validate_objective_compatibility(anchor_manifest, checkpoint_state)
+    from .actor_pipeline import online_dagger_actor
+
+    return online_dagger_actor(args, _training_dtype(args))
+
+
 def warmup(args):
     if getattr(args, "reset_critics", False) and not args.checkpoint:
         raise ValueError("--reset-critics requires --checkpoint")
+    _require_new_output_dir(args.output_dir)
     manifest = _dataset_manifest(args.dataset_dir)
     if manifest.get("dataset_role") == "eval":
         raise RuntimeError("evaluation datasets cannot be used for critic warmup")
     checkpoint_state = _checkpoint_state(args.checkpoint)
-    _reject_failed_actor_audit(checkpoint_state)
+    source_contract = safe_checkpoint_contract(checkpoint_state)
+    if source_contract["checkpoint_role"] == CHECKPOINT_ROLE_DIAGNOSTIC:
+        raise RuntimeError(
+            "critic warmup refuses a diagnostic Actor checkpoint; start from "
+            "original NaViLA/critic-only weights or an independently audited policy"
+        )
     schema = manifest.get("schema_version")
     objective_fingerprint = manifest.get("objective_fingerprint")
+    _validate_dataset_objective(manifest)
     if schema in VERSIONED_DATASET_SCHEMAS and not objective_fingerprint:
         raise RuntimeError("versioned warmup dataset has no objective fingerprint")
     if (
@@ -468,6 +642,13 @@ def warmup(args):
             checkpoint_state["lagrange_multiplier"]
         )
     _copy_actor_contract(state, checkpoint_state)
+    state.update(
+        {
+            "checkpoint_contract_version": SAFE_CHECKPOINT_CONTRACT_VERSION,
+            "checkpoint_role": source_contract["checkpoint_role"],
+            "policy_interface": source_contract["policy_interface"],
+        }
+    )
 
     def validate_metadata(metadata):
         sample_schema = metadata.get("schema_version")
@@ -482,6 +663,8 @@ def warmup(args):
             raise RuntimeError(
                 "warmup sample objective fingerprint does not match manifest"
             )
+        if schema == LIVE_SCHEMA_VERSION and not _has_verified_safety_observation(metadata):
+            return False
         return (
             metadata.get("reward_return") is not None
             and metadata.get("cost_return") is not None
@@ -510,7 +693,9 @@ def warmup(args):
             {
                 "sampling_strategy": sampling_strategy,
                 "sampling_seed": sampling_seed,
-                "sampling": sampling_summary(selected_samples),
+                "sampling": sampling_summary(
+                    selected_samples, action_field="action_id"
+                ),
             }
         )
         print(
@@ -548,6 +733,10 @@ def warmup(args):
                 None if selected_samples is not None else args.max_samples
             ),
         )
+        if int(stats.get("critic/samples", 0)) <= 0:
+            raise RuntimeError(
+                "critic warmup found no eligible reward/cost targets"
+            )
         state.update({"epoch": epoch + 1, **stats})
         print(json.dumps(state), flush=True)
     save_checkpoint(model, optimizer, args.output_dir, state)
@@ -580,13 +769,85 @@ def _load_on_policy_samples(args):
         episode_samples.sort(key=lambda sample: int(sample[1]["index"]))
         metadata = [sample[1] for sample in episode_samples]
         strict_v4 = getattr(args, "rollout_schema", None) == LIVE_SCHEMA_VERSION
+        for item in metadata:
+            for key in (
+                "old_log_prob",
+                "reward_value",
+                "cost_value",
+                "reward",
+                "cost",
+            ):
+                try:
+                    value = float(item[key])
+                except (KeyError, TypeError, ValueError, OverflowError) as error:
+                    raise RuntimeError(
+                        f"rollout episode {episode_id} has invalid {key}"
+                    ) from error
+                if not math.isfinite(value):
+                    raise RuntimeError(
+                        f"rollout episode {episode_id} has non-finite {key}"
+                    )
+                if key == "cost" and value < 0.0:
+                    raise RuntimeError(
+                        f"rollout episode {episode_id} has negative cost"
+                    )
+            action_id = item.get("action_id")
+            index = item.get("index")
+            if (
+                isinstance(action_id, bool)
+                or not isinstance(action_id, int)
+                or not 0 <= action_id <= 9
+            ):
+                raise RuntimeError(
+                    f"rollout episode {episode_id} has invalid action_id"
+                )
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                raise RuntimeError(
+                    f"rollout episode {episode_id} has invalid transition index"
+                )
+            if not isinstance(item.get("done"), bool):
+                raise RuntimeError(
+                    f"rollout episode {episode_id} has non-boolean done flag"
+                )
+            if strict_v4:
+                policy_stats = {
+                    **item,
+                    "log_prob": item["old_log_prob"],
+                }
+                if not has_valid_policy_statistics(
+                    policy_stats,
+                    objective_fingerprint=getattr(
+                        args, "rollout_objective_fingerprint", None
+                    ),
+                ):
+                    raise RuntimeError(
+                        f"rollout episode {episode_id} has inconsistent policy statistics"
+                    )
         if strict_v4:
+            unverified = [
+                int(item["index"])
+                for item in metadata
+                if not _has_verified_safety_observation(item)
+            ]
+            if unverified:
+                raise RuntimeError(
+                    f"rollout episode {episode_id} contains unverified safety "
+                    f"observations at indices {unverified[:5]}"
+                )
+            if any(bool(item.get("oracle_eligible", False)) for item in metadata):
+                raise RuntimeError(
+                    f"rollout episode {episode_id} contains privileged online "
+                    "Oracle labels; collect mainline VLM data without "
+                    "--allow-online-oracle"
+                )
             indices = [int(item["index"]) for item in metadata]
             if indices != list(range(len(indices))) or not bool(metadata[-1]["done"]):
                 raise RuntimeError(
                     f"v4 rollout episode {episode_id} is incomplete or non-contiguous"
                 )
-        episode_costs[episode_id] = sum(float(item["cost"]) for item in metadata)
+        episode_costs[episode_id] = sum(
+            float(item["cost"]) for item in metadata
+        )
         if any(
             not bool(
                 item.get(
@@ -717,12 +978,15 @@ def _validate_sample_objective(samples, manifest):
 def train(args):
     if not args.checkpoint:
         raise ValueError("constrained PPO requires a warmup --checkpoint")
+    _require_new_output_dir(args.output_dir)
     if getattr(args, "reset_critics", False):
         raise ValueError("--reset-critics is valid only for warmup-critics")
     if float(getattr(args, "oracle_ce_coef", 0.0)) < 0:
         raise ValueError("--oracle-ce-coef must be non-negative")
     if float(getattr(args, "oracle_stop_weight", 5.0)) <= 0:
         raise ValueError("--oracle-stop-weight must be positive")
+    if int(getattr(args, "gradient_accumulation_steps", 1)) <= 0:
+        raise ValueError("--gradient-accumulation-steps must be positive")
     manifest = _dataset_manifest(args.rollout_dir)
     if manifest.get("dataset_role") == "eval":
         raise RuntimeError("evaluation datasets cannot be used for PPO training")
@@ -777,6 +1041,7 @@ def train(args):
         ),
     )
     args.rollout_schema = schema
+    args.rollout_objective_fingerprint = objective_fingerprint
     samples, episode_costs = _load_on_policy_samples(args)
     expected_episodes = manifest.get("completed_episodes")
     if (
@@ -791,7 +1056,7 @@ def train(args):
     _validate_sample_objective(samples, manifest)
     _validate_rollout_policy_version(samples, args.policy_version)
     _normalize_rollout_advantages(samples)
-    ppo_sampling = sampling_summary(samples)
+    ppo_sampling = sampling_summary(samples, action_field="action_id")
     print(
         json.dumps(
             {
@@ -811,15 +1076,18 @@ def train(args):
         multiplier=lagrange_before,
         learning_rate=args.lagrange_lr,
     )
-    lagrange.update(mean_cost)
+    lambda_before_update, lambda_after_update = _update_lagrange_for_rollout(
+        lagrange, mean_cost
+    )
     print(
         json.dumps(
             {
                 "constraint/mean_episode_cost": mean_cost,
                 "constraint/cost_limit": args.cost_limit,
                 "constraint/excess": mean_cost - args.cost_limit,
-                "constraint/lambda_before": lagrange_before,
-                "constraint/lambda_after": lagrange.multiplier,
+                "constraint/lambda_before": lambda_before_update,
+                "constraint/lambda_after": lambda_after_update,
+                "constraint/cost_normalization": COST_NORMALIZATION,
             }
         ),
         flush=True,
@@ -827,70 +1095,120 @@ def train(args):
 
     update = 0
     for epoch in range(args.ppo_epochs):
-        for start in range(0, len(samples), args.mini_batch_size):
-            mini_batch = samples[start : start + args.mini_batch_size]
+        print(
+            json.dumps(
+                {
+                    "epoch": epoch + 1,
+                    "constraint/lambda": lagrange.multiplier,
+                    "constraint/mean_episode_cost": mean_cost,
+                    "constraint/cost_limit": args.cost_limit,
+                }
+            ),
+            flush=True,
+        )
+        accumulation_steps = max(
+            1, int(getattr(args, "gradient_accumulation_steps", 1))
+        )
+        for window_start in range(
+            0, len(samples), args.mini_batch_size * accumulation_steps
+        ):
+            micro_batches = [
+                samples[start : start + args.mini_batch_size]
+                for start in range(
+                    window_start,
+                    min(
+                        len(samples),
+                        window_start + args.mini_batch_size * accumulation_steps,
+                    ),
+                    args.mini_batch_size,
+                )
+            ]
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
-            states = [
-                preprocessor(frames, metadata["instruction"])
-                for frames, metadata in mini_batch
-            ]
-            action_ids = torch.tensor(
-                [metadata["action_id"] for _, metadata in mini_batch],
-                device=args.device,
-            )
-            evaluated = evaluate_selected_actions(model, states, action_ids)
-            device = evaluated["new_log_probs"].device
-
-            def tensor(key):
-                return torch.tensor(
-                    [metadata[key] for _, metadata in mini_batch],
-                    dtype=torch.float32,
-                    device=device,
+            ppo.begin_accumulation()
+            micro_stats = []
+            for mini_batch in micro_batches:
+                states = [
+                    preprocessor(frames, metadata["instruction"])
+                    for frames, metadata in mini_batch
+                ]
+                action_ids = torch.tensor(
+                    [metadata["action_id"] for _, metadata in mini_batch],
+                    device=args.device,
                 )
+                evaluated = evaluate_selected_actions(model, states, action_ids)
+                device = evaluated["new_log_probs"].device
 
-            batch = {
-                **evaluated,
-                "old_log_probs": tensor("old_log_prob"),
-                "reward_advantages": tensor("normalized_reward_advantage"),
-                "cost_advantages": tensor("normalized_cost_advantage"),
-                "reward_returns": tensor("ppo_reward_return"),
-                "cost_returns": tensor("ppo_cost_return"),
-                "oracle_action_ids": torch.tensor(
-                    [
-                        int(metadata.get("oracle_action_id") or 0)
-                        for _, metadata in mini_batch
-                    ],
-                    dtype=torch.long,
-                    device=device,
-                ),
-                "oracle_mask": torch.tensor(
-                    [
-                        bool(metadata.get("oracle_eligible", False))
-                        for _, metadata in mini_batch
-                    ],
-                    dtype=torch.bool,
-                    device=device,
-                ),
-                "oracle_sample_weights": torch.tensor(
-                    [
-                        (
-                            float(args.oracle_stop_weight)
-                            if metadata.get("oracle_action_id") == 9
-                            else 1.0
-                        )
-                        for _, metadata in mini_batch
-                    ],
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                "oracle_ce_coef": (
-                    float(args.oracle_ce_coef)
-                    if schema == LIVE_SCHEMA_VERSION
-                    else 0.0
-                ),
-            }
-            stats = ppo.step(batch, lagrange.multiplier)
+                def tensor(key):
+                    return torch.tensor(
+                        [metadata[key] for _, metadata in mini_batch],
+                        dtype=torch.float32,
+                        device=device,
+                    )
+
+                batch = {
+                    **evaluated,
+                    "old_log_probs": tensor("old_log_prob"),
+                    "reward_advantages": tensor("normalized_reward_advantage"),
+                    "cost_advantages": tensor("normalized_cost_advantage"),
+                    "reward_returns": tensor("ppo_reward_return"),
+                    "cost_returns": tensor("ppo_cost_return"),
+                    "oracle_action_ids": torch.tensor(
+                        [
+                            int(metadata.get("oracle_action_id") or 0)
+                            for _, metadata in mini_batch
+                        ],
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                    "oracle_mask": torch.tensor(
+                        [
+                            bool(metadata.get("oracle_eligible", False))
+                            for _, metadata in mini_batch
+                        ],
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                    "oracle_sample_weights": torch.tensor(
+                        [
+                            (
+                                float(args.oracle_stop_weight)
+                                if metadata.get("oracle_action_id") == 9
+                                else 1.0
+                            )
+                            for _, metadata in mini_batch
+                        ],
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    "oracle_ce_coef": (
+                        float(args.oracle_ce_coef)
+                        if schema == LIVE_SCHEMA_VERSION
+                        else 0.0
+                    ),
+                }
+                micro_stats.append(
+                    ppo.accumulate(
+                        batch,
+                        lagrange.multiplier,
+                        gradient_scale=1.0 / len(micro_batches),
+                    )
+                )
+                del states, evaluated, batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            stats = {}
+            for key in micro_stats[0]:
+                values = [float(item[key]) for item in micro_stats]
+                stats[key] = sum(values) / len(values)
+            stats["oracle/samples"] = sum(
+                int(item["oracle/samples"]) for item in micro_stats
+            )
+            stats["oracle/stop_samples"] = sum(
+                int(item["oracle/stop_samples"]) for item in micro_stats
+            )
+            stats["optimizer/grad_norm"] = ppo.finish_accumulation()
+            stats["optimizer/micro_batches"] = len(micro_batches)
             if torch.cuda.is_available():
                 stats["memory/peak_allocated_gib"] = (
                     torch.cuda.max_memory_allocated() / (1024 ** 3)
@@ -907,9 +1225,6 @@ def train(args):
                 ),
                 flush=True,
             )
-            del states, evaluated, batch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     state = {
         "mode": "constrained-ppo",
@@ -933,6 +1248,10 @@ def train(args):
         "sampling_seed": int(getattr(args, "sampling_seed", 20260729)),
         "sampling": ppo_sampling,
         "constraint_episode_count": len(episode_costs),
+        "constraint_cost_normalization": COST_NORMALIZATION,
+        "gradient_accumulation_steps": int(
+            getattr(args, "gradient_accumulation_steps", 1)
+        ),
     }
     _copy_actor_contract(state, checkpoint_state)
     save_checkpoint(model, optimizer, args.output_dir, state)

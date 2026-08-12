@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import sys
 
 import pytest
 
@@ -89,3 +90,43 @@ def test_balanced_episode_ids_cover_scenes_before_repeating():
     }
     assert len(first_scenes) == 3
     assert balanced_episode_ids(episodes, seed=7) == selected
+
+
+def test_native_launcher_forwards_the_validated_dataset_path(monkeypatch, tmp_path):
+    dataset_path = tmp_path / "train_isaac.json.gz"
+    monkeypatch.setattr(
+        safe_vln_main,
+        "load_isaac_vlnce_payload",
+        lambda *args, **kwargs: {"episodes": [{"episode_id": 1}]},
+    )
+    launched = []
+    monkeypatch.setattr(
+        safe_vln_main.subprocess,
+        "run",
+        lambda command, check=False: launched.append(command)
+        or SimpleNamespace(returncode=0),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "safe_vln_main.py",
+            "collect",
+            "--r2r-data-path",
+            str(dataset_path),
+            "--dataset-dir",
+            str(tmp_path / "output"),
+            "--start-idx",
+            "0",
+            "--end-idx",
+            "1",
+            "--max-episode-seconds",
+            "12.5",
+        ],
+    )
+
+    args = safe_vln_main.parse_args()
+    assert safe_vln_main.run_episodes(args) == 0
+    assert len(launched) == 1
+    assert f"--r2r-data-path={dataset_path}" in launched[0]
+    assert launched[0].count("--max_episode_seconds=12.5") == 1

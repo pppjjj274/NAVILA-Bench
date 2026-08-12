@@ -78,3 +78,59 @@ def test_policy_stop_uses_episode_goal_radius(distance, expected_success):
     decision = controller.resolve(9, distance, navigation_reward_valid=True)
     assert decision.success is expected_success
     assert decision.failed_stop is (not expected_success)
+
+
+def test_sensor_gate_forces_success_inside_goal():
+    controller = GoalStopController(
+        goal_radius=3.0, mode="sensor-gated", dataset_role="train"
+    )
+    decision = controller.resolve(8, 2.0, navigation_reward_valid=True)
+    assert decision.executed_action_id == 9
+    assert decision.success
+    assert decision.goal_gate_reason == "goal_radius_stop"
+    assert decision.termination_reason == "sensor_gated_success"
+
+
+def test_sensor_gate_replaces_premature_stop_with_best_motion():
+    controller = GoalStopController(
+        goal_radius=3.0, mode="sensor-gated", dataset_role="train"
+    )
+    probabilities = [0.01] * 10
+    probabilities[7] = 0.4
+    probabilities[9] = 0.5
+    decision = controller.resolve(
+        9,
+        4.0,
+        navigation_reward_valid=True,
+        action_probabilities=probabilities,
+    )
+    assert decision.executed_action_id == 7
+    assert decision.shield_intervened
+    assert not decision.immediate_terminal
+    assert decision.goal_gate_reason == "premature_stop_rejected"
+
+
+@pytest.mark.parametrize(
+    ("reward_valid", "probabilities", "reason"),
+    [
+        (False, [0.1] * 10, "goal_distance_unavailable"),
+        (True, None, "goal_gate_no_fallback"),
+    ],
+)
+def test_sensor_gate_fails_closed(reward_valid, probabilities, reason):
+    controller = GoalStopController(
+        goal_radius=3.0, mode="sensor-gated", dataset_role="eval"
+    )
+    decision = controller.resolve(
+        9,
+        4.0,
+        navigation_reward_valid=reward_valid,
+        action_probabilities=probabilities,
+    )
+    assert decision.executed_action_id == 9
+    assert decision.immediate_terminal
+    assert not decision.success
+    assert decision.termination_reason == reason
+    assert decision.failed_stop is (
+        reward_valid and probabilities is None
+    )

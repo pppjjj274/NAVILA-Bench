@@ -1,5 +1,4 @@
 import json
-import tarfile
 
 from PIL import Image
 import pytest
@@ -30,6 +29,31 @@ def test_atomic_shard_round_trip(tmp_path):
     assert manifest["schema_version"] == "safe-vln-go2-v1"
     assert manifest["samples_written_this_run"] == 1
     assert manifest["total_samples"] == 1
+
+
+def test_shard_writer_rejects_duplicate_sample_keys(tmp_path):
+    frames = [Image.new("RGB", (8, 8)) for _ in range(8)]
+    writer = SafeVLNShardWriter(tmp_path)
+    writer.add("episode1/state000000", frames, {"episode_id": "1"})
+    with pytest.raises(ValueError, match="duplicate sample key"):
+        writer.add("episode1/state000000", frames, {"episode_id": "1"})
+
+
+def test_shard_writer_rejects_duplicate_keys_from_an_earlier_run(tmp_path):
+    frames = [Image.new("RGB", (8, 8)) for _ in range(8)]
+    with SafeVLNShardWriter(tmp_path) as writer:
+        writer.add("episode1/state000000", frames, {"episode_id": "1"})
+
+    with pytest.raises(ValueError, match="duplicate sample key"):
+        with SafeVLNShardWriter(tmp_path) as writer:
+            writer.add("episode1/state000000", frames, {"episode_id": "1"})
+
+
+def test_shard_writer_rejects_non_finite_metadata(tmp_path):
+    frames = [Image.new("RGB", (8, 8)) for _ in range(8)]
+    with pytest.raises(ValueError, match="Out of range float values"):
+        with SafeVLNShardWriter(tmp_path) as writer:
+            writer.add("episode1/state000000", frames, {"cost": float("nan")})
 
 
 def test_jpeg_encoder_does_not_use_pillow_save_when_opencv_is_available(
@@ -99,3 +123,18 @@ def test_transactional_episode_abort_publishes_nothing(tmp_path):
     writer.abort()
     assert not (tmp_path / "manifest.json").exists()
     assert not list((tmp_path / "completed").glob("*"))
+
+
+def test_transactional_episode_rejects_empty_commit(tmp_path):
+    writer = SafeVLNEpisodeWriter(
+        tmp_path,
+        "empty",
+        dataset_role="train",
+        split="train",
+        schema_version=LIVE_SCHEMA_VERSION,
+        objective_config=build_objective_config(default_cost_profile()),
+    )
+    with pytest.raises(RuntimeError, match="empty Safe-VLN episode"):
+        writer.commit()
+    assert not (tmp_path / "manifest.json").exists()
+    assert not (tmp_path / "completed" / "empty").exists()

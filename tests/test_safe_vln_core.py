@@ -3,6 +3,7 @@ import math
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from safe_vln.actions import (
     ACTIONS,
@@ -14,6 +15,7 @@ from safe_vln.actions import (
 from safe_vln.cmdp import LagrangeController, compute_gae, compute_returns, safe_advantage
 from safe_vln.trainer import constrained_ppo_loss
 from safe_vln.trajectory import SafeTrajectoryRecorder
+from safe_vln.native_history import sample_native_history
 
 
 def test_canonical_action_space_and_legacy_parser():
@@ -24,6 +26,9 @@ def test_canonical_action_space_and_legacy_parser():
     assert ACTIONS[7].duration == 1.0
     assert action_from_text("turn right 45 degrees")[0].action_id == 5
     assert action_from_text("unparseable action") == (ACTIONS[9], True)
+    assert normalize_policy_response(
+        "The next action is move forward 50 cm."
+    )["policy_interface"] == "navila-greedy-text-v1"
 
 
 def test_structured_response_uses_local_command_and_rejects_bad_values():
@@ -33,17 +38,22 @@ def test_structured_response_uses_local_command_and_rejects_bad_values():
     assert result["velocity_command"] == [0.5, 0.0, 0.0]
     assert result["reward_value"] is None
     assert result["cost_value"] == 0.2
+    assert normalize_policy_response({"action_id": 2.7})["invalid_action"] is True
+    assert normalize_policy_response({"action_id": True})["invalid_action"] is True
 
 
 def test_structured_response_records_normalized_action_probabilities():
-    probabilities = [1.0] * len(ACTIONS)
+    probabilities = [0.1] * len(ACTIONS)
     result = normalize_policy_response(
         {"action_id": 6, "action_probabilities": probabilities}
     )
 
     assert result["action_probabilities"] == pytest.approx(
-        [1.0 / len(ACTIONS)] * len(ACTIONS)
+        probabilities
     )
+    assert normalize_policy_response(
+        {"action_id": 6, "action_probabilities": [1.0] * len(ACTIONS)}
+    )["action_probabilities"] is None
     assert normalize_policy_response(
         {"action_id": 6, "action_probabilities": [1.0, float("nan")]}
     )["action_probabilities"] is None
@@ -52,15 +62,36 @@ def test_structured_response_records_normalized_action_probabilities():
     )["objective_fingerprint"] == "objective"
 
 
+def test_native_history_marks_repeat_first_padding():
+    entries = [
+        {
+            "image": Image.new("RGB", (2, 2), color=index),
+            "metadata": {"frame_index": index, "physics_step": index * 25},
+        }
+        for index in range(3)
+    ]
+    sampled = sample_native_history(entries, num_frames=8)
+
+    assert len(sampled) == 8
+    assert sum(item["metadata"]["history_padding"] for item in sampled) == 5
+    assert all(
+        not item["metadata"]["strict_observation_state_alignment"]
+        for item in sampled[:5]
+    )
+    assert sampled[-1]["metadata"]["frame_index"] == 2
+    assert sampled[-1]["metadata"]["strict_observation_state_alignment"] is not False
+
+
 def test_ppo_statistics_require_matching_objective_and_complete_values():
     output = normalize_policy_response(
         {
             "action_id": 8,
-            "log_prob": -1.0,
+            "log_prob": math.log(0.1),
             "reward_value": 0.5,
             "cost_value": 0.2,
-            "policy_version": 3,
-            "objective_fingerprint": "objective-a",
+                "policy_version": 3,
+                "policy_interface": "safe-vln-discrete-v1",
+                "objective_fingerprint": "objective-a",
             "action_probabilities": [0.1] * len(ACTIONS),
         }
     )
@@ -69,6 +100,28 @@ def test_ppo_statistics_require_matching_objective_and_complete_values():
     )
     assert not has_valid_policy_statistics(
         output, objective_fingerprint="objective-b"
+    )
+    output["policy_interface"] = "navila-greedy-text-v1"
+    assert not has_valid_policy_statistics(
+        output, objective_fingerprint="objective-a"
+    )
+
+
+def test_ppo_statistics_reject_probability_log_prob_mismatch():
+    output = normalize_policy_response(
+        {
+            "action_id": 8,
+            "log_prob": -1.0,
+            "reward_value": 0.5,
+            "cost_value": 0.2,
+            "policy_version": 3,
+            "policy_interface": "safe-vln-discrete-v1",
+            "objective_fingerprint": "objective-a",
+            "action_probabilities": [0.1] * len(ACTIONS),
+        }
+    )
+    assert not has_valid_policy_statistics(
+        output, objective_fingerprint="objective-a"
     )
 
 
@@ -124,6 +177,76 @@ def test_trajectory_records_blocked_as_terminal_cost():
     assert recorder.transitions[0]["cost_return"] == 1.0
     assert recorder.summary()["blocked_count"] == 1.0
     assert recorder.summary()["has_blocked"] is True
+
+
+def test_hard_event_cost_is_not_diluted_by_long_episode():
+    recorder = SafeTrajectoryRecorder(
+        episode_id="1",
+        scene_id="scene",
+        instruction="go",
+        cost_limit=0.25,
+    )
+    for index in range(5):
+        recorder.begin(normalize_policy_response({"action_id": 8}), 5.0)
+        recorder.count_env_step()
+        recorder.finish(
+            distance_after=5.0,
+            unsafe_contact=index == 4,
+            terminated=index == 4,
+        )
+
+    summary = recorder.summary()
+
+    assert summary["cumulative_cost"] == 1.0
+    assert summary["constraint_cost"] == 1.0
+    assert summary["cost_normalization"] == "cumulative_episode_sum"
+    assert summary["constraint_satisfied"] is False
+
+
+def test_trajectory_records_failed_turn_as_non_terminal_diagnostic():
+    recorder = SafeTrajectoryRecorder(
+        episode_id="1", scene_id="scene", instruction="go", cost_limit=0.0
+    )
+    recorder.begin(normalize_policy_response({"action_id": 2}), 5.0)
+    recorder.count_env_step()
+    item = recorder.finish(
+        distance_after=5.0,
+        turn_blocked=True,
+        safety_diagnostics={
+            "turn_blocked": True,
+            "turn_execution": {"execution_ratio": 0.0},
+        },
+        terminated=False,
+        termination_reason=None,
+    )
+    assert item["cost"] == 0.0
+    assert item["hard_violation"] is False
+    assert item["cost_components"]["turn_blocked"] == 1.0
+    assert item["cost_components"]["turn_tracking_failure"] == 1.0
+    assert recorder.summary()["turn_blocked_count"] == 1.0
+    assert recorder.summary()["turn_tracking_failure_count"] == 1.0
+    assert recorder.summary()["has_turn_blocked"] is True
+    assert recorder.summary()["has_turn_tracking_failure"] is True
+
+
+def test_trajectory_truncation_closes_observation_chain():
+    recorder = SafeTrajectoryRecorder(
+        episode_id="1", scene_id="scene", instruction="go"
+    )
+    recorder.begin(normalize_policy_response({"action_id": 8}), 5.0)
+    recorder.count_env_step()
+    recorder.finish(distance_after=4.5)
+    recorder.transitions[-1]["next_observation_key"] = "episode1/state000001"
+
+    recorder.truncate_last("max_vlm_calls")
+    recorder.finalize()
+
+    transition = recorder.transitions[-1]
+    assert transition["done"] is True
+    assert transition["terminated"] is False
+    assert transition["truncated"] is True
+    assert transition["termination_reason"] == "max_vlm_calls"
+    assert transition["next_observation_key"] is None
 
 
 def test_trajectory_penalizes_and_summarizes_missed_stop():

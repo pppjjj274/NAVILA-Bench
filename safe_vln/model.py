@@ -11,7 +11,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from .actions import ACTIONS, NAVILA_ACTION_RESPONSES
+from .actions import NAVILA_ACTION_RESPONSES
 
 
 @dataclass
@@ -21,6 +21,8 @@ class SafeActorCriticOutput:
     cost_values: torch.Tensor
     stop_logits: torch.Tensor | None = None
     motion_logits: torch.Tensor | None = None
+    direction_logits: torch.Tensor | None = None
+    magnitude_logits: torch.Tensor | None = None
 
     @property
     def distribution(self):
@@ -44,6 +46,7 @@ class ValueHead(nn.Module):
 
 ACTOR_ARCHITECTURE_CANDIDATE = "candidate-scoring"
 ACTOR_ARCHITECTURE_HIERARCHICAL = "hierarchical-stop-motion"
+ACTOR_ARCHITECTURE_FACTORIZED = "hierarchical-stop-direction-magnitude"
 
 
 class HierarchicalActorHead(nn.Module):
@@ -79,6 +82,51 @@ class HierarchicalActorHead(nn.Module):
         )
 
 
+
+class FactorizedActorHead(nn.Module):
+    """Factor motions into direction and direction-conditioned magnitude."""
+
+    def __init__(self, hidden_size: int, intermediate_size: int = 512) -> None:
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, intermediate_size),
+            nn.GELU(),
+        )
+        self.stop_head = nn.Linear(intermediate_size, 1)
+        self.direction_head = nn.Linear(intermediate_size, 3)
+        self.magnitude_head = nn.Linear(intermediate_size, 9)
+
+    def forward(self, hidden_state: torch.Tensor):
+        parameters = next(self.parameters())
+        hidden_state = hidden_state.to(
+            device=parameters.device, dtype=parameters.dtype
+        )
+        feature = self.projection(hidden_state)
+        magnitude_logits = self.magnitude_head(feature).reshape(-1, 3, 3)
+        return (
+            self.stop_head(feature).squeeze(-1),
+            self.direction_head(feature),
+            magnitude_logits,
+        )
+
+    @staticmethod
+    def motion_log_probs(direction_logits, magnitude_logits):
+        direction = torch.log_softmax(direction_logits.float(), dim=-1)
+        magnitude = torch.log_softmax(magnitude_logits.float(), dim=-1)
+        return (direction.unsqueeze(-1) + magnitude).reshape(-1, 9)
+
+    @classmethod
+    def joint_log_probs(cls, stop_logits, direction_logits, magnitude_logits):
+        motion = cls.motion_log_probs(direction_logits, magnitude_logits)
+        log_stop = -torch.nn.functional.softplus(-stop_logits)
+        log_continue = -torch.nn.functional.softplus(stop_logits)
+        return torch.cat(
+            (log_continue.float().unsqueeze(-1) + motion,
+             log_stop.float().unsqueeze(-1)),
+            dim=-1,
+        )
+
 class SafeNavilaActorCritic(nn.Module):
     """Score canonical response sequences and predict reward/cost values.
 
@@ -102,6 +150,7 @@ class SafeNavilaActorCritic(nn.Module):
         if actor_architecture not in {
             ACTOR_ARCHITECTURE_CANDIDATE,
             ACTOR_ARCHITECTURE_HIERARCHICAL,
+            ACTOR_ARCHITECTURE_FACTORIZED,
         }:
             raise ValueError(f"unsupported actor architecture: {actor_architecture}")
         if not 0.0 < float(stop_threshold) < 1.0:
@@ -119,11 +168,12 @@ class SafeNavilaActorCritic(nn.Module):
                 raise ValueError("could not infer NaViLA hidden size")
         self.reward_head = ValueHead(int(hidden_size))
         self.cost_head = ValueHead(int(hidden_size))
-        self.actor_head = (
-            HierarchicalActorHead(int(hidden_size))
-            if actor_architecture == ACTOR_ARCHITECTURE_HIERARCHICAL
-            else None
-        )
+        if actor_architecture == ACTOR_ARCHITECTURE_HIERARCHICAL:
+            self.actor_head = HierarchicalActorHead(int(hidden_size))
+        elif actor_architecture == ACTOR_ARCHITECTURE_FACTORIZED:
+            self.actor_head = FactorizedActorHead(int(hidden_size))
+        else:
+            self.actor_head = None
         self._candidate_ids = [
             tokenizer(text, add_special_tokens=False, return_tensors="pt").input_ids[0]
             for text in NAVILA_ACTION_RESPONSES
@@ -325,14 +375,63 @@ class SafeNavilaActorCritic(nn.Module):
             motion_logits=motion_logits,
         )
 
+    def _forward_factorized(self, prompt_input_ids, images=None, **model_kwargs):
+        if not isinstance(self.actor_head, FactorizedActorHead):
+            raise RuntimeError("factorized actor head is not initialized")
+        state_hidden = self.encode_state(
+            prompt_input_ids, images=images, **model_kwargs
+        )
+        stop_logits, direction_logits, magnitude_logits = self.actor_head(
+            state_hidden
+        )
+        motion_logits = self.actor_head.motion_log_probs(
+            direction_logits, magnitude_logits
+        )
+        return SafeActorCriticOutput(
+            action_logits=self.actor_head.joint_log_probs(
+                stop_logits, direction_logits, magnitude_logits
+            ),
+            reward_values=self.reward_head(state_hidden),
+            cost_values=self.cost_head(state_hidden),
+            stop_logits=stop_logits,
+            motion_logits=motion_logits,
+            direction_logits=direction_logits,
+            magnitude_logits=magnitude_logits,
+        )
+
     def forward(self, prompt_input_ids, images=None, **model_kwargs):
         if self.actor_architecture == ACTOR_ARCHITECTURE_HIERARCHICAL:
             return self._forward_hierarchical(
                 prompt_input_ids, images=images, **model_kwargs
             )
+        if self.actor_architecture == ACTOR_ARCHITECTURE_FACTORIZED:
+            return self._forward_factorized(
+                prompt_input_ids, images=images, **model_kwargs
+            )
         return self._forward_candidate(
             prompt_input_ids, images=images, **model_kwargs
         )
+
+    def forward_values(self, prompt_input_ids, images=None, **model_kwargs):
+        """Return differentiable critics without evaluating the Actor."""
+        state_hidden = self.encode_state(
+            prompt_input_ids, images=images, **model_kwargs
+        )
+        return {
+            "reward_values": self.reward_head(state_hidden),
+            "cost_values": self.cost_head(state_hidden),
+        }
+
+    def predict_values(self, prompt_input_ids, images=None, **model_kwargs):
+        """Predict serializable critics without invoking the discrete Actor."""
+
+        values = self.forward_values(
+            prompt_input_ids, images=images, **model_kwargs
+        )
+        return {
+            "reward_value": float(values["reward_values"].item()),
+            "cost_value": float(values["cost_values"].item()),
+        }
 
     def act(self, prompt_input_ids, images=None, deterministic: bool = False, **model_kwargs):
         output = self.forward(prompt_input_ids, images=images, **model_kwargs)
@@ -362,14 +461,23 @@ class SafeNavilaActorCritic(nn.Module):
         torch.save(self.cost_head.state_dict(), output_dir / "cost_critic.pt")
         if self.actor_head is not None:
             torch.save(self.actor_head.state_dict(), output_dir / "actor_head.pt")
+        actor_config = {
+            "schema_version": 2,
+            "architecture": self.actor_architecture,
+            "stop_threshold": self.stop_threshold,
+        }
+        if self.actor_architecture == ACTOR_ARCHITECTURE_FACTORIZED:
+            actor_config["action_factorization"] = {
+                "directions": ["left", "right", "forward"],
+                "magnitudes": ["small", "medium", "large"],
+                "action_mapping": [
+                    [0, 1, 2],
+                    [3, 4, 5],
+                    [6, 7, 8],
+                ],
+            }
         (output_dir / "actor_config.json").write_text(
-            json.dumps(
-                {
-                    "architecture": self.actor_architecture,
-                    "stop_threshold": self.stop_threshold,
-                },
-                indent=2,
-            ),
+            json.dumps(actor_config, indent=2),
             encoding="utf-8",
         )
 

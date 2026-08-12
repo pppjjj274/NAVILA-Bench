@@ -57,6 +57,7 @@ if __name__ == "__main__":
     eval_args = [f"--task={args.task}", "--num_envs=1",
                  f"--load_run={args.low_level_policy_dir}",
                  "--headless", "--enable_cameras",
+                 f"--r2r-data-path={args.r2r_data_path}",
                  f"--vlm_host={args.vlm_host}",
                  f"--vlm_port={args.vlm_port}",
                  ]

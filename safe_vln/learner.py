@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Mapping
 
 import torch
 
 from .actions import ACTIONS
-from .trainer import SafePPOOptimizer
 
 
 def train_critic_epoch(model, samples, preprocessor, optimizer, *, max_samples: int | None = None):
@@ -28,11 +27,21 @@ def train_critic_epoch(model, samples, preprocessor, optimizer, *, max_samples: 
         if not reward_eligible and not cost_eligible:
             continue
         state = preprocessor(frames, metadata["instruction"])
-        output = model(state.input_ids, images=state.images)
-        reward_target = torch.tensor([metadata["reward_return"]], device=output.reward_values.device)
-        cost_target = torch.tensor([metadata["cost_return"]], device=output.cost_values.device)
-        reward_loss = 0.5 * (output.reward_values - reward_target).square().mean()
-        cost_loss = 0.5 * (output.cost_values - cost_target).square().mean()
+        # Critic warmup must not invoke the untrained replacement Actor.  Apart
+        # from wasting ten LLM forwards for candidate scoring, doing so couples
+        # critic-only checkpoints to exactly the policy path they must retain
+        # from original NaViLA.
+        values = model.forward_values(state.input_ids, images=state.images)
+        reward_values = values["reward_values"]
+        cost_values = values["cost_values"]
+        reward_target = torch.tensor(
+            [metadata["reward_return"]], device=reward_values.device
+        )
+        cost_target = torch.tensor(
+            [metadata["cost_return"]], device=cost_values.device
+        )
+        reward_loss = 0.5 * (reward_values - reward_target).square().mean()
+        cost_loss = 0.5 * (cost_values - cost_target).square().mean()
         loss = (
             reward_loss * float(reward_eligible)
             + cost_loss * float(cost_eligible)

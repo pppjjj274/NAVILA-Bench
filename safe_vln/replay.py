@@ -228,19 +228,20 @@ def _parse_official_oracle_action(raw_action: str, *, video_id: str) -> SafeActi
     return action_from_id(action_id)
 
 
-def _sample_frame_paths(frame_paths: Sequence[Path]) -> tuple[Path | None, ...]:
+def _sample_frame_paths(frame_paths: Sequence[Path]) -> tuple[Path, ...]:
     """Apply ``navila_eval.sample_eight_images`` to paths.
 
-    ``None`` represents a black padding frame.  Keeping the sampling at the
-    path level ensures that long cumulative histories do not cause every
-    source image to be decoded.
+    Repeat the first valid observation for a short history instead of creating
+    synthetic black frames.  Keeping the sampling at the path level ensures
+    that long cumulative histories do not cause every source image to be
+    decoded.
     """
     if not frame_paths:
         raise ValueError("R2R replay step did not provide any frames")
 
     if len(frame_paths) < _NUM_REPLAY_FRAMES:
-        padding = (None,) * (_NUM_REPLAY_FRAMES - len(frame_paths))
-        candidates: tuple[Path | None, ...] = padding + tuple(frame_paths)
+        padding = (frame_paths[0],) * (_NUM_REPLAY_FRAMES - len(frame_paths))
+        candidates: tuple[Path, ...] = padding + tuple(frame_paths)
     else:
         candidates = tuple(frame_paths)
 
@@ -272,7 +273,7 @@ class R2RReplayStep:
     raw_oracle_action: str
     oracle_action: SafeAction
     frame_paths: tuple[Path, ...]
-    sampled_frame_paths: tuple[Path | None, ...] = field(init=False)
+    sampled_frame_paths: tuple[Path, ...] = field(init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sampled_frame_paths", _sample_frame_paths(self.frame_paths))
@@ -280,23 +281,15 @@ class R2RReplayStep:
     def load_frames(self) -> list[Image.Image]:
         """Decode exactly eight sampled RGB frames.
 
-        Padding is inserted before the real observations and uses the current
-        observation's dimensions.  The last returned frame is therefore
-        always the current observation.
+        Short histories repeat the first valid observation. The last returned
+        frame is therefore always the current observation.
         """
         real_frames: dict[Path, Image.Image] = {}
         try:
-            for path in dict.fromkeys(
-                path for path in self.sampled_frame_paths if path is not None
-            ):
+            for path in dict.fromkeys(self.sampled_frame_paths):
                 real_frames[path] = _open_rgb(path)
-            current_path = self.sampled_frame_paths[-1]
-            assert current_path is not None
-            current = real_frames[current_path]
             frames = [
-                Image.new("RGB", current.size, (0, 0, 0))
-                if path is None
-                else real_frames[path].copy()
+                real_frames[path].copy()
                 for path in self.sampled_frame_paths
             ]
         finally:

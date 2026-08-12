@@ -7,7 +7,7 @@ import math
 from typing import Any, Mapping
 
 from .cmdp import compute_returns
-from .objective import SCHEMA_VERSION
+from .objective import COST_NORMALIZATION, SCHEMA_VERSION
 
 
 class SafeTrajectoryRecorder:
@@ -25,6 +25,7 @@ class SafeTrajectoryRecorder:
         missed_stop_penalty: float = -0.5,
         cost_limit: float = 0.0,
         objective_config: Mapping[str, Any] | None = None,
+        schema_version: str | None = None,
     ) -> None:
         self.episode_id = str(episode_id)
         self.scene_id = scene_id
@@ -38,9 +39,13 @@ class SafeTrajectoryRecorder:
         self.cost_limit = cost_limit
         self.objective_config = deepcopy(dict(objective_config or {}))
         self.schema_version = (
-            str(self.objective_config.get("schema_version", SCHEMA_VERSION))
-            if self.objective_config
-            else "safe-vln-go2-v1"
+            str(schema_version)
+            if schema_version is not None
+            else (
+                str(self.objective_config.get("schema_version", SCHEMA_VERSION))
+                if self.objective_config
+                else "safe-vln-go2-v1"
+            )
         )
         self.transitions: list[dict[str, Any]] = []
         self._active: dict[str, Any] | None = None
@@ -58,6 +63,7 @@ class SafeTrajectoryRecorder:
             "cost_value": policy_output.get("cost_value"),
             "old_log_prob": policy_output.get("log_prob"),
             "policy_version": policy_output.get("policy_version"),
+            "policy_interface": policy_output.get("policy_interface"),
             "policy_objective_fingerprint": policy_output.get(
                 "objective_fingerprint"
             ),
@@ -77,6 +83,7 @@ class SafeTrajectoryRecorder:
                 "fall": False,
                 "blocked": False,
             },
+            "_turn_tracking_failure": False,
         }
 
     def count_env_step(self) -> None:
@@ -107,6 +114,12 @@ class SafeTrajectoryRecorder:
             self._active["_hard_events"][key] = bool(
                 self._active["_hard_events"][key] or safety.get(key, False)
             )
+        self._active["_turn_tracking_failure"] = bool(
+            self._active["_turn_tracking_failure"]
+            or safety.get(
+                "turn_tracking_failure", safety.get("turn_blocked", False)
+            )
+        )
 
     def finish(
         self,
@@ -120,6 +133,7 @@ class SafeTrajectoryRecorder:
         unsafe_contact: bool = False,
         fall: bool = False,
         blocked: bool = False,
+        turn_blocked: bool = False,
         safety_diagnostics: Mapping[str, Any] | None = None,
         terminated: bool = False,
         truncated: bool = False,
@@ -158,6 +172,14 @@ class SafeTrajectoryRecorder:
         )
         hard_events["fall"] = bool(hard_events["fall"] or fall)
         hard_events["blocked"] = bool(hard_events["blocked"] or blocked)
+        turn_tracking_failure = bool(
+            transition.pop("_turn_tracking_failure")
+            or turn_blocked
+            or (safety_diagnostics or {}).get(
+                "turn_tracking_failure",
+                (safety_diagnostics or {}).get("turn_blocked", False),
+            )
+        )
         hard_cost = float(any(hard_events.values()))
         count = int(transition["executed_env_steps"])
         risk_mean = transition.pop("_risk_sum") / max(count, 1)
@@ -196,6 +218,10 @@ class SafeTrajectoryRecorder:
                     "unsafe_contact": float(hard_events["unsafe_contact"]),
                     "fall": float(hard_events["fall"]),
                     "blocked": float(hard_events["blocked"]),
+                    # Controller tracking diagnostics are retained for analysis
+                    # but are excluded from the CMDP cost and terminal signal.
+                    "turn_tracking_failure": float(turn_tracking_failure),
+                    "turn_blocked": float(turn_tracking_failure),
                     "collision_event": float(hard_events["unsafe_contact"]),
                     "fall_event": float(hard_events["fall"]),
                     "blocked_event": float(hard_events["blocked"]),
@@ -229,9 +255,35 @@ class SafeTrajectoryRecorder:
             item["reward_return"] = reward_return
             item["cost_return"] = cost_return
 
+    def truncate_last(self, reason: str) -> None:
+        """Close an otherwise complete final decision at an external limit."""
+
+        if self._active is not None:
+            raise RuntimeError("cannot truncate an active macro action")
+        if not self.transitions:
+            raise RuntimeError("cannot truncate an empty trajectory")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("truncation reason must be a non-empty string")
+        transition = self.transitions[-1]
+        if transition.get("done"):
+            raise RuntimeError("final transition is already terminal")
+        transition.update(
+            {
+                "done": True,
+                "terminated": False,
+                "truncated": True,
+                "termination_reason": reason,
+                "next_observation_key": None,
+            }
+        )
+
     def summary(self, measurements: Mapping[str, Any] | None = None) -> dict[str, Any]:
         measurements = measurements or {}
         cumulative_cost = sum(item.get("cost", 0.0) for item in self.transitions)
+        # Match the CMDP used by SafeVLA: constrain expected cumulative
+        # episode cost. Averaging by trajectory length would dilute a unit
+        # collision/fall cost and could mark a long unsafe episode as safe.
+        constraint_cost = cumulative_cost
         policy_success = any(
             bool(item.get("policy_success", item.get("success", False)))
             for item in self.transitions
@@ -241,7 +293,7 @@ class SafeTrajectoryRecorder:
             for item in self.transitions
         )
         success = bool(system_success or measurements.get("success", False))
-        constraint_satisfied = cumulative_cost <= self.cost_limit
+        constraint_satisfied = constraint_cost <= self.cost_limit
         last_reason = self.transitions[-1].get("termination_reason") if self.transitions else None
         spl = float(measurements.get("spl", 0.0) or 0.0)
         valid_distances = [
@@ -281,14 +333,46 @@ class SafeTrajectoryRecorder:
             "system_success": system_success,
             "total_high_level_reward": sum(item.get("reward", 0.0) for item in self.transitions),
             "cumulative_cost": cumulative_cost,
+            "constraint_cost": constraint_cost,
+            "cost_normalization": COST_NORMALIZATION,
             "cumulative_hard_cost": sum(item.get("hard_cost", 0.0) for item in self.transitions),
             "cumulative_dense_cost": sum(item.get("dense_cost", 0.0) for item in self.transitions),
             "hard_violation_count": sum(bool(item.get("hard_violation", False)) for item in self.transitions),
             "unsafe_contact_count": sum(item.get("cost_components", {}).get("unsafe_contact", 0.0) for item in self.transitions),
             "fall_count": sum(item.get("cost_components", {}).get("fall", 0.0) for item in self.transitions),
             "blocked_count": sum(item.get("cost_components", {}).get("blocked", 0.0) for item in self.transitions),
+            "turn_tracking_failure_count": sum(
+                item.get("cost_components", {}).get(
+                    "turn_tracking_failure",
+                    item.get("cost_components", {}).get("turn_blocked", 0.0),
+                )
+                for item in self.transitions
+            ),
+            "turn_blocked_count": sum(
+                item.get("cost_components", {}).get(
+                    "turn_tracking_failure",
+                    item.get("cost_components", {}).get("turn_blocked", 0.0),
+                )
+                for item in self.transitions
+            ),
             "has_collision": any(item.get("cost_components", {}).get("unsafe_contact", 0.0) > 0 for item in self.transitions),
             "has_blocked": any(item.get("cost_components", {}).get("blocked", 0.0) > 0 for item in self.transitions),
+            "has_turn_tracking_failure": any(
+                item.get("cost_components", {}).get(
+                    "turn_tracking_failure",
+                    item.get("cost_components", {}).get("turn_blocked", 0.0),
+                )
+                > 0
+                for item in self.transitions
+            ),
+            "has_turn_blocked": any(
+                item.get("cost_components", {}).get(
+                    "turn_tracking_failure",
+                    item.get("cost_components", {}).get("turn_blocked", 0.0),
+                )
+                > 0
+                for item in self.transitions
+            ),
             "num_macro_actions": len(self.transitions),
             "invalid_action_count": sum(bool(item.get("invalid_action")) for item in self.transitions),
             "entered_goal_radius": entered_goal,
@@ -308,6 +392,10 @@ class SafeTrajectoryRecorder:
             ),
             "shield_intervention_count": sum(
                 bool(item.get("shield_intervened", False))
+                for item in self.transitions
+            ),
+            "goal_gate_intervention_count": sum(
+                bool(item.get("goal_gate_intervened", item.get("shield_intervened", False)))
                 for item in self.transitions
             ),
             "goal_escape_after_entry": goal_escape_after_entry,
